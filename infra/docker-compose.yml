@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: viacontab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: viacontab
+      POSTGRES_PASSWORD: viacontab
+      POSTGRES_DB: viacontab
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: viacontab-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  backend:
+    build:
+      context: ../backend
+    container_name: viacontab-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://viacontab:viacontab@postgres:5432/viacontab
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXTRACTION_MODEL: ${EXTRACTION_MODEL:-openai/gpt-5.1-nano}
+      QDRANT_URL: http://qdrant:6333
+      PYTHONPATH: /app
+      DEBUG_LEARNING: ${DEBUG_LEARNING:-false}
+    depends_on:
+      - postgres
+      - qdrant
+    ports:
+      - "8100:8000"
+
+  frontend:
+    build:
+      context: ../frontend
+    container_name: viacontab-frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-http://backend:8000}
+      NEXT_PUBLIC_DEBUG_LEARNING: ${NEXT_PUBLIC_DEBUG_LEARNING:-false}
+    depends_on:
+      - backend
+    ports:
+      - "7100:3000"
+
+volumes:
+  postgres_data:
+  qdrant_data:

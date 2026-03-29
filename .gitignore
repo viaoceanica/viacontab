@@ -1,0 +1,13 @@
+backend/.env
+backend/.env.*
+!backend/.env.example
+infra/.env
+infra/.env.*
+!infra/.env.example
+frontend/.env
+frontend/.env.*
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.DS_Store
