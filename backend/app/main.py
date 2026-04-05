@@ -146,6 +146,12 @@ MISSING_TENANT_PROFILE_COLUMNS = {
     "company_nif": "ALTER TABLE tenant_profiles ADD COLUMN company_nif VARCHAR(128)",
 }
 
+MISSING_CATALOG_ALIAS_COLUMNS = {
+    "usage_confirmed_count": "ALTER TABLE catalog_aliases ADD COLUMN usage_confirmed_count INTEGER DEFAULT 0",
+    "usage_auto_apply_count": "ALTER TABLE catalog_aliases ADD COLUMN usage_auto_apply_count INTEGER DEFAULT 0",
+    "last_used_at": "ALTER TABLE catalog_aliases ADD COLUMN last_used_at TIMESTAMP",
+}
+
 COLUMN_LENGTH_REQUIREMENTS = {
     ("invoices", "supplier_nif"): 128,
     ("invoices", "customer_nif"): 128,
@@ -229,6 +235,22 @@ def ensure_invoice_columns() -> None:
         }
         for column_name, ddl in MISSING_TENANT_PROFILE_COLUMNS.items():
             if column_name not in tenant_profile_columns:
+                connection.execute(text(ddl))
+
+        catalog_alias_columns = {
+            row[0]
+            for row in connection.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'catalog_aliases'
+                    """
+                )
+            )
+        }
+        for column_name, ddl in MISSING_CATALOG_ALIAS_COLUMNS.items():
+            if column_name not in catalog_alias_columns:
                 connection.execute(text(ddl))
 
 
@@ -1810,6 +1832,8 @@ def suggest_line_item_labels(
         confidence = alias.confidence
         if confidence is not None:
             score += int(float(confidence) * 10)
+        score += min(int(alias.usage_confirmed_count or 0), 100) * 3
+        score += min(int(alias.usage_auto_apply_count or 0), 100) * 1
 
         suggestion = LineItemSuggestion(
             canonical_name=catalog_item.canonical_name,
@@ -1920,6 +1944,8 @@ def _apply_label_to_line_item(
             alias.raw_label = line_item.description or payload.canonical_name
             alias.confidence = Decimal("0.99")
             alias.source = "manual"
+            alias.usage_confirmed_count = int(alias.usage_confirmed_count or 0) + 1
+            alias.last_used_at = datetime.utcnow()
         else:
             session.add(
                 CatalogAlias(
@@ -1929,6 +1955,9 @@ def _apply_label_to_line_item(
                     catalog_item_id=catalog_item.id,
                     confidence=Decimal("0.99"),
                     source="manual",
+                    usage_confirmed_count=1,
+                    usage_auto_apply_count=0,
+                    last_used_at=datetime.utcnow(),
                 )
             )
 
@@ -1977,6 +2006,16 @@ def _auto_backfill_alias_matches(
         candidate.review_reason = None
         session.add(candidate)
         updated_count += 1
+
+    if updated_count > 0:
+        alias = (
+            session.query(CatalogAlias)
+            .filter(CatalogAlias.tenant_id == tenant_id, CatalogAlias.normalized_label == alias_label)
+            .one_or_none()
+        )
+        if alias:
+            alias.usage_auto_apply_count = int(alias.usage_auto_apply_count or 0) + updated_count
+            alias.last_used_at = datetime.utcnow()
 
     return updated_count
 
@@ -2072,6 +2111,16 @@ def label_line_item_bulk(
             candidate.review_reason = None
             session.add(candidate)
             updated_count += 1
+
+        if updated_count > 1:
+            alias = (
+                session.query(CatalogAlias)
+                .filter(CatalogAlias.tenant_id == tenant_id, CatalogAlias.normalized_label == alias_label)
+                .one_or_none()
+            )
+            if alias:
+                alias.usage_auto_apply_count = int(alias.usage_auto_apply_count or 0) + (updated_count - 1)
+                alias.last_used_at = datetime.utcnow()
     else:
         updated_count = 1
 
