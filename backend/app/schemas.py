@@ -216,6 +216,13 @@ class LineItemSuggestionListResponse(BaseModel):
     items: list[LineItemSuggestion]
 
 
+class LineItemQualitySummary(BaseModel):
+    total_lines: int = 0
+    mapped_lines: int = 0
+    review_lines: int = 0
+    mapped_rate_pct: Decimal = Decimal("0")
+
+
 class AutomationBlockerRow(BaseModel):
     invoice_id: uuid.UUID
     invoice_number: Optional[str] = None

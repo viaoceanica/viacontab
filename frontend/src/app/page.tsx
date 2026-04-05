@@ -143,6 +143,13 @@ interface LineItemLabelMetadata {
   normalized_unit?: string;
 }
 
+interface LineItemQualitySummary {
+  total_lines: number;
+  mapped_lines: number;
+  review_lines: number;
+  mapped_rate_pct: number | string;
+}
+
 interface AutomationBlocker {
   invoice_id: string;
   invoice_number?: string | null;
@@ -270,6 +277,7 @@ export default function Home() {
   const [labelDrafts, setLabelDrafts] = useState<Record<string, string>>({});
   const [labelSuggestions, setLabelSuggestions] = useState<Record<string, LineItemSuggestion[]>>({});
   const [labelMetadataDrafts, setLabelMetadataDrafts] = useState<Record<string, LineItemLabelMetadata>>({});
+  const [lineItemQuality, setLineItemQuality] = useState<LineItemQualitySummary>({ total_lines: 0, mapped_lines: 0, review_lines: 0, mapped_rate_pct: 0 });
   const [detailInvoice, setDetailInvoice] = useState<Invoice | null>(null);
   const [tenantProfile, setTenantProfile] = useState<TenantProfile>({ company_name: "", company_nif: "" });
   const [isSavingTenantProfile, setIsSavingTenantProfile] = useState(false);
@@ -392,6 +400,23 @@ export default function Home() {
     }
   }, [tenantId, apiBase]);
 
+  const fetchLineItemQuality = useCallback(async () => {
+    if (!tenantId) return;
+    try {
+      const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/quality`);
+      const data = await parseResponse(response);
+      if (!response.ok) return;
+      setLineItemQuality({
+        total_lines: Number(data?.total_lines || 0),
+        mapped_lines: Number(data?.mapped_lines || 0),
+        review_lines: Number(data?.review_lines || 0),
+        mapped_rate_pct: data?.mapped_rate_pct ?? 0,
+      });
+    } catch (error) {
+      console.error(error);
+    }
+  }, [tenantId, apiBase]);
+
   const fetchAutomationBlockers = useCallback(async () => {
     if (!tenantId) return;
     try {
@@ -425,10 +450,11 @@ export default function Home() {
     void fetchInvoices();
     void fetchFailedImports();
     void fetchReviewLineItems();
+    void fetchLineItemQuality();
     void fetchAutomationBlockers();
     void fetchTenantProfile();
     void fetchWatchtower();
-  }, [fetchInvoices, fetchFailedImports, fetchReviewLineItems, fetchAutomationBlockers, fetchTenantProfile, fetchWatchtower]);
+  }, [fetchInvoices, fetchFailedImports, fetchReviewLineItems, fetchLineItemQuality, fetchAutomationBlockers, fetchTenantProfile, fetchWatchtower]);
 
   useEffect(() => {
     if (!isLoading) return;
@@ -767,21 +793,23 @@ export default function Home() {
     }));
   }, [labelSuggestions]);
 
-  const fetchLabelSuggestions = useCallback(async (lineItemId: string, value: string) => {
+  const fetchLabelSuggestions = useCallback(async (lineItemId: string, value: string): Promise<LineItemSuggestion[]> => {
     const query = value.trim();
     if (query.length < 2) {
       setLabelSuggestions((prev) => ({ ...prev, [lineItemId]: [] }));
-      return;
+      return [];
     }
     try {
       const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/suggestions?query=${encodeURIComponent(query)}&limit=8`);
       const data = await parseResponse(response);
-      if (!response.ok) return;
+      if (!response.ok) return [];
       const items = Array.isArray(data?.items) ? data.items : [];
       setLabelSuggestions((prev) => ({ ...prev, [lineItemId]: items }));
       applySuggestionMetadata(lineItemId, query, items);
+      return items;
     } catch (error) {
       console.error(error);
+      return [];
     }
   }, [apiBase, tenantId, applySuggestionMetadata]);
 
@@ -816,15 +844,20 @@ export default function Home() {
     }
   }, [labelDrafts, labelMetadataDrafts, apiBase, tenantId, fetchReviewLineItems, fetchInvoices, fetchAutomationBlockers]);
 
-  const handleSaveLineLabelBulk = useCallback(async (row: ReviewLineItem) => {
-    const canonicalName = (labelDrafts[row.line_item_id] ?? row.description ?? "").trim();
-    const metadata = labelMetadataDrafts[row.line_item_id] ?? {};
+  const handleSaveLineLabelBulk = useCallback(async (
+    row: ReviewLineItem,
+    scope: "vendor" | "tenant" = "vendor",
+    canonicalOverride?: string,
+    metadataOverride?: LineItemLabelMetadata,
+  ) => {
+    const canonicalName = (canonicalOverride ?? labelDrafts[row.line_item_id] ?? row.description ?? "").trim();
+    const metadata = metadataOverride ?? labelMetadataDrafts[row.line_item_id] ?? {};
     if (!canonicalName) {
       setStatus("Defina um nome canónico antes de gravar.");
       return;
     }
     try {
-      const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/${row.line_item_id}/label-bulk?scope=vendor`, {
+      const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/${row.line_item_id}/label-bulk?scope=${scope}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -840,12 +873,38 @@ export default function Home() {
       }
       setStatus(`Mapeamento guardado em lote: ${canonicalName} (${data?.updated_count ?? 1} linha(s) atualizada(s))`);
       await fetchReviewLineItems();
+      await fetchLineItemQuality();
       await fetchInvoices();
       await fetchAutomationBlockers();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Falha ao gravar mapeamento em lote");
     }
-  }, [labelDrafts, labelMetadataDrafts, apiBase, tenantId, fetchReviewLineItems, fetchInvoices, fetchAutomationBlockers]);
+  }, [labelDrafts, labelMetadataDrafts, apiBase, tenantId, fetchReviewLineItems, fetchLineItemQuality, fetchInvoices, fetchAutomationBlockers]);
+
+  const handleAcceptTopSuggestion = useCallback(async (row: ReviewLineItem) => {
+    const current = (labelDrafts[row.line_item_id] ?? row.description ?? "").trim();
+    let suggestions = labelSuggestions[row.line_item_id] ?? [];
+    if (suggestions.length === 0) {
+      suggestions = await fetchLabelSuggestions(row.line_item_id, current || row.description || "");
+    }
+    const top = suggestions[0];
+    if (!top?.canonical_name) {
+      setStatus("Sem sugestão disponível para esta linha.");
+      return;
+    }
+    handleLabelDraftChange(row.line_item_id, top.canonical_name);
+    applySuggestionMetadata(row.line_item_id, top.canonical_name, suggestions);
+    await handleSaveLineLabelBulk(
+      { ...row },
+      "tenant",
+      top.canonical_name,
+      {
+        line_type: top.line_type || undefined,
+        line_category: top.line_category || undefined,
+        normalized_unit: top.normalized_unit || undefined,
+      },
+    );
+  }, [labelDrafts, labelSuggestions, fetchLabelSuggestions, handleLabelDraftChange, applySuggestionMetadata, handleSaveLineLabelBulk]);
 
   const handleUpload = useCallback(async () => {
     if (!tenantId) {
@@ -1657,6 +1716,9 @@ export default function Home() {
 
             <section style={{ ...cardStyle }}>
               <h2 style={{ marginTop: 0 }}>Linhas a rever</h2>
+              <div style={{ fontSize: 12, color: "#475569", marginBottom: 8 }}>
+                cobertura: {lineItemQuality.mapped_lines}/{lineItemQuality.total_lines} mapeadas ({Number(lineItemQuality.mapped_rate_pct || 0).toFixed(2)}%) · pendentes: {lineItemQuality.review_lines}
+              </div>
               {reviewLineItems.length === 0 ? (
                 <div style={{ color: "#94a3b8" }}>Sem linhas pendentes de revisão.</div>
               ) : (
@@ -1735,6 +1797,12 @@ export default function Home() {
                                   style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid #a7f3d0", background: "#ecfdf5" }}
                                 >
                                   Gravar + semelhantes
+                                </button>
+                                <button
+                                  onClick={() => void handleAcceptTopSuggestion(row)}
+                                  style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid #fcd34d", background: "#fef9c3" }}
+                                >
+                                  Aceitar sugestão #1
                                 </button>
                                 <button
                                   onClick={() => void handleOpenReviewInvoice(row)}

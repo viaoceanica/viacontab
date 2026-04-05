@@ -56,6 +56,7 @@ from .schemas import (
     LineItemBulkLabelResponse,
     LineItemSuggestion,
     LineItemSuggestionListResponse,
+    LineItemQualitySummary,
     LineItemReviewRow,
     InvoiceListResponse,
     InvoiceUpdateRequest,
@@ -1827,6 +1828,44 @@ def suggest_line_item_labels(
     return {"items": [item.model_dump(mode="json") for item in items]}
 
 
+@app.get("/api/tenants/{tenant_id}/line-items/quality", response_model=LineItemQualitySummary)
+def line_items_quality_summary(tenant_id: str, session: Session = Depends(get_session)):
+    tenant_id = require_tenant(tenant_id)
+
+    total_lines = (
+        session.query(func.count(InvoiceLineItem.id))
+        .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+        .filter(Invoice.tenant_id == tenant_id)
+        .scalar()
+        or 0
+    )
+    mapped_lines = (
+        session.query(func.count(InvoiceLineItem.id))
+        .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+        .filter(Invoice.tenant_id == tenant_id, InvoiceLineItem.catalog_item_id.isnot(None))
+        .scalar()
+        or 0
+    )
+    review_lines = (
+        session.query(func.count(InvoiceLineItem.id))
+        .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+        .filter(Invoice.tenant_id == tenant_id, InvoiceLineItem.needs_review.is_(True))
+        .scalar()
+        or 0
+    )
+
+    mapped_rate_pct = Decimal("0")
+    if total_lines:
+        mapped_rate_pct = (Decimal(mapped_lines) * Decimal("100")) / Decimal(total_lines)
+
+    return {
+        "total_lines": int(total_lines),
+        "mapped_lines": int(mapped_lines),
+        "review_lines": int(review_lines),
+        "mapped_rate_pct": mapped_rate_pct.quantize(Decimal("0.01")),
+    }
+
+
 def _apply_label_to_line_item(
     *,
     tenant_id: str,
@@ -1897,6 +1936,51 @@ def _apply_label_to_line_item(
     return catalog_item, alias_label
 
 
+def _auto_backfill_alias_matches(
+    *,
+    tenant_id: str,
+    source_line_item_id: UUID,
+    alias_label: str | None,
+    catalog_item: CatalogItem,
+    payload: LineItemLabelRequest,
+    session: Session,
+) -> int:
+    if not alias_label:
+        return 0
+
+    updated_count = 0
+    candidates = (
+        session.query(InvoiceLineItem, Invoice)
+        .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+        .filter(
+            Invoice.tenant_id == tenant_id,
+            InvoiceLineItem.id != source_line_item_id,
+            InvoiceLineItem.needs_review.is_(True),
+            InvoiceLineItem.description.isnot(None),
+        )
+        .limit(5000)
+        .all()
+    )
+    for candidate, _invoice in candidates:
+        candidate_alias = normalize_catalog_lookup_label(candidate.description or "")
+        if candidate_alias != alias_label:
+            continue
+        candidate.catalog_item_id = catalog_item.id
+        if payload.line_type:
+            candidate.line_type = payload.line_type
+        if payload.line_category:
+            candidate.line_category = payload.line_category
+        if payload.normalized_unit:
+            candidate.normalized_unit = payload.normalized_unit
+        candidate.normalization_confidence = Decimal("0.97")
+        candidate.needs_review = False
+        candidate.review_reason = None
+        session.add(candidate)
+        updated_count += 1
+
+    return updated_count
+
+
 @app.post("/api/tenants/{tenant_id}/line-items/{line_item_id}/label", response_model=InvoiceLineItemBase)
 def label_line_item(
     tenant_id: str,
@@ -1912,7 +1996,20 @@ def label_line_item(
     if not invoice or invoice.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Linha não encontrada para este tenant")
 
-    _apply_label_to_line_item(tenant_id=tenant_id, line_item=line_item, payload=payload, session=session)
+    catalog_item, alias_label = _apply_label_to_line_item(
+        tenant_id=tenant_id,
+        line_item=line_item,
+        payload=payload,
+        session=session,
+    )
+    _auto_backfill_alias_matches(
+        tenant_id=tenant_id,
+        source_line_item_id=line_item.id,
+        alias_label=alias_label,
+        catalog_item=catalog_item,
+        payload=payload,
+        session=session,
+    )
     session.commit()
     session.refresh(line_item)
     return line_item
