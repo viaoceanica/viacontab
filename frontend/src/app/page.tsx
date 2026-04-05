@@ -137,6 +137,12 @@ interface LineItemSuggestion {
   source?: string | null;
 }
 
+interface LineItemLabelMetadata {
+  line_type?: string;
+  line_category?: string;
+  normalized_unit?: string;
+}
+
 interface AutomationBlocker {
   invoice_id: string;
   invoice_number?: string | null;
@@ -263,6 +269,7 @@ export default function Home() {
   const [automationBlockers, setAutomationBlockers] = useState<AutomationBlocker[]>([]);
   const [labelDrafts, setLabelDrafts] = useState<Record<string, string>>({});
   const [labelSuggestions, setLabelSuggestions] = useState<Record<string, LineItemSuggestion[]>>({});
+  const [labelMetadataDrafts, setLabelMetadataDrafts] = useState<Record<string, LineItemLabelMetadata>>({});
   const [detailInvoice, setDetailInvoice] = useState<Invoice | null>(null);
   const [tenantProfile, setTenantProfile] = useState<TenantProfile>({ company_name: "", company_nif: "" });
   const [isSavingTenantProfile, setIsSavingTenantProfile] = useState(false);
@@ -744,6 +751,22 @@ export default function Home() {
     setLabelDrafts((prev) => ({ ...prev, [lineItemId]: value }));
   }, []);
 
+  const applySuggestionMetadata = useCallback((lineItemId: string, value: string, sourceSuggestions?: LineItemSuggestion[]) => {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return;
+    const candidates = sourceSuggestions ?? labelSuggestions[lineItemId] ?? [];
+    const match = candidates.find((item) => (item.canonical_name || "").trim().toLowerCase() === normalized);
+    if (!match) return;
+    setLabelMetadataDrafts((prev) => ({
+      ...prev,
+      [lineItemId]: {
+        line_type: match.line_type || undefined,
+        line_category: match.line_category || undefined,
+        normalized_unit: match.normalized_unit || undefined,
+      },
+    }));
+  }, [labelSuggestions]);
+
   const fetchLabelSuggestions = useCallback(async (lineItemId: string, value: string) => {
     const query = value.trim();
     if (query.length < 2) {
@@ -754,14 +777,17 @@ export default function Home() {
       const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/suggestions?query=${encodeURIComponent(query)}&limit=8`);
       const data = await parseResponse(response);
       if (!response.ok) return;
-      setLabelSuggestions((prev) => ({ ...prev, [lineItemId]: Array.isArray(data?.items) ? data.items : [] }));
+      const items = Array.isArray(data?.items) ? data.items : [];
+      setLabelSuggestions((prev) => ({ ...prev, [lineItemId]: items }));
+      applySuggestionMetadata(lineItemId, query, items);
     } catch (error) {
       console.error(error);
     }
-  }, [apiBase, tenantId]);
+  }, [apiBase, tenantId, applySuggestionMetadata]);
 
   const handleSaveLineLabel = useCallback(async (row: ReviewLineItem) => {
     const canonicalName = (labelDrafts[row.line_item_id] ?? row.description ?? "").trim();
+    const metadata = labelMetadataDrafts[row.line_item_id] ?? {};
     if (!canonicalName) {
       setStatus("Defina um nome canónico antes de gravar.");
       return;
@@ -770,7 +796,12 @@ export default function Home() {
       const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/${row.line_item_id}/label`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ canonical_name: canonicalName }),
+        body: JSON.stringify({
+          canonical_name: canonicalName,
+          line_type: metadata.line_type,
+          line_category: metadata.line_category,
+          normalized_unit: metadata.normalized_unit,
+        }),
       });
       const data = await parseResponse(response);
       if (!response.ok) {
@@ -783,10 +814,11 @@ export default function Home() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Falha ao gravar mapeamento");
     }
-  }, [labelDrafts, apiBase, tenantId, fetchReviewLineItems, fetchInvoices, fetchAutomationBlockers]);
+  }, [labelDrafts, labelMetadataDrafts, apiBase, tenantId, fetchReviewLineItems, fetchInvoices, fetchAutomationBlockers]);
 
   const handleSaveLineLabelBulk = useCallback(async (row: ReviewLineItem) => {
     const canonicalName = (labelDrafts[row.line_item_id] ?? row.description ?? "").trim();
+    const metadata = labelMetadataDrafts[row.line_item_id] ?? {};
     if (!canonicalName) {
       setStatus("Defina um nome canónico antes de gravar.");
       return;
@@ -795,7 +827,12 @@ export default function Home() {
       const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/${row.line_item_id}/label-bulk?scope=vendor`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ canonical_name: canonicalName }),
+        body: JSON.stringify({
+          canonical_name: canonicalName,
+          line_type: metadata.line_type,
+          line_category: metadata.line_category,
+          normalized_unit: metadata.normalized_unit,
+        }),
       });
       const data = await parseResponse(response);
       if (!response.ok) {
@@ -808,7 +845,7 @@ export default function Home() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Falha ao gravar mapeamento em lote");
     }
-  }, [labelDrafts, apiBase, tenantId, fetchReviewLineItems, fetchInvoices, fetchAutomationBlockers]);
+  }, [labelDrafts, labelMetadataDrafts, apiBase, tenantId, fetchReviewLineItems, fetchInvoices, fetchAutomationBlockers]);
 
   const handleUpload = useCallback(async () => {
     if (!tenantId) {
@@ -1662,6 +1699,7 @@ export default function Home() {
                                 onChange={(event) => {
                                   const value = event.target.value;
                                   handleLabelDraftChange(row.line_item_id, value);
+                                  applySuggestionMetadata(row.line_item_id, value);
                                   void fetchLabelSuggestions(row.line_item_id, value);
                                 }}
                                 onFocus={() => void fetchLabelSuggestions(row.line_item_id, labelDrafts[row.line_item_id] ?? row.description ?? "")}
@@ -1676,6 +1714,15 @@ export default function Home() {
                                   </option>
                                 ))}
                               </datalist>
+                              {labelMetadataDrafts[row.line_item_id] ? (
+                                <div style={{ fontSize: 11, color: "#64748b" }}>
+                                  auto: {labelMetadataDrafts[row.line_item_id].line_type || "—"}
+                                  {" · "}
+                                  {labelMetadataDrafts[row.line_item_id].line_category || "—"}
+                                  {" · "}
+                                  {labelMetadataDrafts[row.line_item_id].normalized_unit || "—"}
+                                </div>
+                              ) : null}
                               <div style={{ display: "flex", gap: 6 }}>
                                 <button
                                   onClick={() => void handleSaveLineLabel(row)}
