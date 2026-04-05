@@ -21,7 +21,7 @@ import zipfile
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session, selectinload
 
 from .config import get_settings
@@ -54,6 +54,8 @@ from .schemas import (
     LineItemReviewListResponse,
     LineItemLabelRequest,
     LineItemBulkLabelResponse,
+    LineItemSuggestion,
+    LineItemSuggestionListResponse,
     LineItemReviewRow,
     InvoiceListResponse,
     InvoiceUpdateRequest,
@@ -1751,6 +1753,77 @@ def list_line_items_for_review(tenant_id: str, limit: int = 200, session: Sessio
         )
         for line, invoice in rows
     ]
+    return {"items": [item.model_dump(mode="json") for item in items]}
+
+
+@app.get("/api/tenants/{tenant_id}/line-items/suggestions", response_model=LineItemSuggestionListResponse)
+def suggest_line_item_labels(
+    tenant_id: str,
+    query: str,
+    limit: int = 8,
+    session: Session = Depends(get_session),
+):
+    tenant_id = require_tenant(tenant_id)
+    limit = max(1, min(limit, 25))
+    normalized_query = normalize_catalog_lookup_label(query)
+    if len(normalized_query) < 2:
+        return {"items": []}
+
+    alias_rows = (
+        session.query(CatalogAlias, CatalogItem)
+        .join(CatalogItem, CatalogAlias.catalog_item_id == CatalogItem.id)
+        .filter(
+            CatalogAlias.tenant_id == tenant_id,
+            or_(
+                CatalogAlias.normalized_label.ilike(f"%{normalized_query}%"),
+                CatalogItem.canonical_name.ilike(f"%{normalized_query}%"),
+                CatalogItem.display_name.ilike(f"%{query.strip()}%"),
+            ),
+        )
+        .limit(200)
+        .all()
+    )
+
+    ranked: dict[str, tuple[int, LineItemSuggestion]] = {}
+    for alias, catalog_item in alias_rows:
+        if not catalog_item.canonical_name:
+            continue
+
+        alias_label = alias.normalized_label or ""
+        score = 0
+        if alias_label == normalized_query:
+            score += 100
+        elif alias_label.startswith(normalized_query):
+            score += 80
+        elif normalized_query in alias_label:
+            score += 60
+
+        canonical = catalog_item.canonical_name or ""
+        if canonical == normalized_query:
+            score += 30
+        elif canonical.startswith(normalized_query):
+            score += 20
+        elif normalized_query in canonical:
+            score += 10
+
+        confidence = alias.confidence
+        if confidence is not None:
+            score += int(float(confidence) * 10)
+
+        suggestion = LineItemSuggestion(
+            canonical_name=catalog_item.canonical_name,
+            display_name=catalog_item.display_name,
+            line_type=catalog_item.item_type,
+            line_category=catalog_item.category_path,
+            normalized_unit=catalog_item.base_unit,
+            confidence=alias.confidence,
+            source=alias.source or "alias",
+        )
+        previous = ranked.get(catalog_item.canonical_name)
+        if previous is None or score > previous[0]:
+            ranked[catalog_item.canonical_name] = (score, suggestion)
+
+    items = [entry[1] for entry in sorted(ranked.values(), key=lambda item: item[0], reverse=True)[:limit]]
     return {"items": [item.model_dump(mode="json") for item in items]}
 
 

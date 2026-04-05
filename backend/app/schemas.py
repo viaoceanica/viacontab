@@ -202,6 +202,20 @@ class LineItemBulkLabelResponse(BaseModel):
     updated_count: int
 
 
+class LineItemSuggestion(BaseModel):
+    canonical_name: str
+    display_name: Optional[str] = None
+    line_type: Optional[str] = None
+    line_category: Optional[str] = None
+    normalized_unit: Optional[str] = None
+    confidence: Optional[Decimal] = None
+    source: str = "alias"
+
+
+class LineItemSuggestionListResponse(BaseModel):
+    items: list[LineItemSuggestion]
+
+
 class AutomationBlockerRow(BaseModel):
     invoice_id: uuid.UUID
     invoice_number: Optional[str] = None

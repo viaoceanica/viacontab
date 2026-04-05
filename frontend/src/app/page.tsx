@@ -127,6 +127,16 @@ interface ReviewLineItem {
   review_reason?: string | null;
 }
 
+interface LineItemSuggestion {
+  canonical_name: string;
+  display_name?: string | null;
+  line_type?: string | null;
+  line_category?: string | null;
+  normalized_unit?: string | null;
+  confidence?: number | string | null;
+  source?: string | null;
+}
+
 interface AutomationBlocker {
   invoice_id: string;
   invoice_number?: string | null;
@@ -252,6 +262,7 @@ export default function Home() {
   const [reviewLineItems, setReviewLineItems] = useState<ReviewLineItem[]>([]);
   const [automationBlockers, setAutomationBlockers] = useState<AutomationBlocker[]>([]);
   const [labelDrafts, setLabelDrafts] = useState<Record<string, string>>({});
+  const [labelSuggestions, setLabelSuggestions] = useState<Record<string, LineItemSuggestion[]>>({});
   const [detailInvoice, setDetailInvoice] = useState<Invoice | null>(null);
   const [tenantProfile, setTenantProfile] = useState<TenantProfile>({ company_name: "", company_nif: "" });
   const [isSavingTenantProfile, setIsSavingTenantProfile] = useState(false);
@@ -732,6 +743,22 @@ export default function Home() {
   const handleLabelDraftChange = useCallback((lineItemId: string, value: string) => {
     setLabelDrafts((prev) => ({ ...prev, [lineItemId]: value }));
   }, []);
+
+  const fetchLabelSuggestions = useCallback(async (lineItemId: string, value: string) => {
+    const query = value.trim();
+    if (query.length < 2) {
+      setLabelSuggestions((prev) => ({ ...prev, [lineItemId]: [] }));
+      return;
+    }
+    try {
+      const response = await fetch(`${apiBase}/api/tenants/${tenantId}/line-items/suggestions?query=${encodeURIComponent(query)}&limit=8`);
+      const data = await parseResponse(response);
+      if (!response.ok) return;
+      setLabelSuggestions((prev) => ({ ...prev, [lineItemId]: Array.isArray(data?.items) ? data.items : [] }));
+    } catch (error) {
+      console.error(error);
+    }
+  }, [apiBase, tenantId]);
 
   const handleSaveLineLabel = useCallback(async (row: ReviewLineItem) => {
     const canonicalName = (labelDrafts[row.line_item_id] ?? row.description ?? "").trim();
@@ -1632,10 +1659,23 @@ export default function Home() {
                             <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 220 }}>
                               <input
                                 value={labelDrafts[row.line_item_id] ?? row.description ?? ""}
-                                onChange={(event) => handleLabelDraftChange(row.line_item_id, event.target.value)}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  handleLabelDraftChange(row.line_item_id, value);
+                                  void fetchLabelSuggestions(row.line_item_id, value);
+                                }}
+                                onFocus={() => void fetchLabelSuggestions(row.line_item_id, labelDrafts[row.line_item_id] ?? row.description ?? "")}
                                 placeholder="Nome canónico"
+                                list={`label-suggestions-${row.line_item_id}`}
                                 style={{ padding: 6, borderRadius: 8, border: "1px solid #cbd5f5" }}
                               />
+                              <datalist id={`label-suggestions-${row.line_item_id}`}>
+                                {(labelSuggestions[row.line_item_id] ?? []).map((suggestion) => (
+                                  <option key={`${row.line_item_id}-${suggestion.canonical_name}`} value={suggestion.canonical_name}>
+                                    {suggestion.display_name || suggestion.canonical_name}
+                                  </option>
+                                ))}
+                              </datalist>
                               <div style={{ display: "flex", gap: 6 }}>
                                 <button
                                   onClick={() => void handleSaveLineLabel(row)}
