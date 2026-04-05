@@ -22,12 +22,25 @@ class InvoiceLineItemBase(BaseModel):
     id: uuid.UUID
     code: Optional[str] = None
     description: Optional[str] = None
+    normalized_description: Optional[str] = None
     quantity: Optional[Decimal] = None
     unit_price: Optional[Decimal] = None
     line_subtotal: Optional[Decimal] = None
     line_tax_amount: Optional[Decimal] = None
     line_total: Optional[Decimal] = None
     tax_rate: Optional[Decimal] = None
+    tax_rate_source: Optional[str] = None
+    catalog_item_id: Optional[uuid.UUID] = None
+    raw_unit: Optional[str] = None
+    normalized_unit: Optional[str] = None
+    measurement_type: Optional[str] = None
+    normalized_quantity: Optional[Decimal] = None
+    normalized_unit_price: Optional[Decimal] = None
+    line_category: Optional[str] = None
+    line_type: Optional[str] = None
+    normalization_confidence: Optional[Decimal] = None
+    needs_review: bool = False
+    review_reason: Optional[str] = None
 
 
 class InvoiceLineItemUpdateRequest(BaseModel):
@@ -36,6 +49,7 @@ class InvoiceLineItemUpdateRequest(BaseModel):
     id: Optional[uuid.UUID] = None
     code: Optional[str] = None
     description: Optional[str] = None
+    raw_unit: Optional[str] = None
     quantity: Optional[Decimal] = None
     unit_price: Optional[Decimal] = None
     line_subtotal: Optional[Decimal] = None
@@ -78,6 +92,11 @@ class InvoiceBase(BaseModel):
     raw_text: Optional[str] = None
     ai_payload: Optional[str] = None
     extraction_model: Optional[str] = None
+    token_input: Optional[int] = None
+    token_output: Optional[int] = None
+    token_total: Optional[int] = None
+    confidence_score: Optional[Decimal] = None
+    requires_review: bool = False
     notes: Optional[str] = None
     line_items: list[InvoiceLineItemBase] = []
     learning_debug: Optional[LearningDebugInfo] = None
@@ -123,8 +142,84 @@ class InvoiceUpdateRequest(BaseModel):
     line_items: Optional[list[InvoiceLineItemUpdateRequest]] = None
 
 
+class RejectedDocument(BaseModel):
+    filename: str
+    reason: str
+    detected_type: Optional[str] = None
+
+
+class FailedImportBase(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    tenant_id: str
+    filename: str
+    mime_type: Optional[str] = None
+    file_size: Optional[int] = None
+    reason: str
+    detected_type: Optional[str] = None
+    source: str
+    retry_count: int = 0
+    last_retry_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class FailedImportListResponse(BaseModel):
+    items: list[FailedImportBase]
+
+
+class LineItemReviewRow(BaseModel):
+    invoice_id: uuid.UUID
+    invoice_number: Optional[str] = None
+    vendor: Optional[str] = None
+    filename: str
+    created_at: datetime
+    line_item_id: uuid.UUID
+    position: Optional[Decimal] = None
+    description: Optional[str] = None
+    line_total: Optional[Decimal] = None
+    tax_rate: Optional[Decimal] = None
+    tax_rate_source: Optional[str] = None
+    normalization_confidence: Optional[Decimal] = None
+    review_reason: Optional[str] = None
+
+
+class LineItemReviewListResponse(BaseModel):
+    items: list[LineItemReviewRow]
+
+
+class LineItemLabelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    canonical_name: str = Field(..., min_length=2, max_length=255)
+    line_type: Optional[str] = None
+    line_category: Optional[str] = None
+    normalized_unit: Optional[str] = None
+
+
+class LineItemBulkLabelResponse(BaseModel):
+    line_item_id: uuid.UUID
+    updated_count: int
+
+
+class AutomationBlockerRow(BaseModel):
+    invoice_id: uuid.UUID
+    invoice_number: Optional[str] = None
+    filename: str
+    vendor: Optional[str] = None
+    code: str
+    severity: str
+    message: str
+    created_at: datetime
+
+
+class AutomationBlockerListResponse(BaseModel):
+    items: list[AutomationBlockerRow]
+
+
 class IngestResponse(BaseModel):
     ingested: list[InvoiceBase]
+    rejected: list[RejectedDocument] = []
 
 
 class InvoiceCorrectionRequest(BaseModel):
@@ -151,3 +246,30 @@ class ChatResponse(BaseModel):
     answer: str
     references: list[ChatReference]
 
+
+class CostTrendPoint(BaseModel):
+    invoice_id: uuid.UUID
+    invoice_number: Optional[str] = None
+    vendor: Optional[str] = None
+    created_at: datetime
+    description: Optional[str] = None
+    canonical_item: Optional[str] = None
+    normalized_unit: Optional[str] = None
+    normalized_quantity: Optional[Decimal] = None
+    normalized_unit_price: Optional[Decimal] = None
+
+
+class CostTrendSummary(BaseModel):
+    current_avg_unit_price: Optional[Decimal] = None
+    previous_avg_unit_price: Optional[Decimal] = None
+    pct_change: Optional[Decimal] = None
+    sample_size_current: int = 0
+    sample_size_previous: int = 0
+    days: int = 90
+    vendor: Optional[str] = None
+    item_query: str
+
+
+class CostTrendResponse(BaseModel):
+    summary: CostTrendSummary
+    points: list[CostTrendPoint]

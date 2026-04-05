@@ -53,6 +53,7 @@ from .schemas import (
     InvoiceLineItemBase,
     LineItemReviewListResponse,
     LineItemLabelRequest,
+    LineItemBulkLabelResponse,
     LineItemReviewRow,
     InvoiceListResponse,
     InvoiceUpdateRequest,
@@ -1753,21 +1754,13 @@ def list_line_items_for_review(tenant_id: str, limit: int = 200, session: Sessio
     return {"items": [item.model_dump(mode="json") for item in items]}
 
 
-@app.post("/api/tenants/{tenant_id}/line-items/{line_item_id}/label", response_model=InvoiceLineItemBase)
-def label_line_item(
+def _apply_label_to_line_item(
+    *,
     tenant_id: str,
-    line_item_id: UUID,
+    line_item: InvoiceLineItem,
     payload: LineItemLabelRequest,
-    session: Session = Depends(get_session),
-):
-    tenant_id = require_tenant(tenant_id)
-    line_item = session.get(InvoiceLineItem, line_item_id)
-    if not line_item:
-        raise HTTPException(status_code=404, detail="Linha não encontrada")
-    invoice = session.get(Invoice, line_item.invoice_id)
-    if not invoice or invoice.tenant_id != tenant_id:
-        raise HTTPException(status_code=404, detail="Linha não encontrada para este tenant")
-
+    session: Session,
+) -> tuple[CatalogItem, str]:
     canonical_name = normalize_catalog_lookup_label(payload.canonical_name)
     if not canonical_name:
         raise HTTPException(status_code=400, detail="canonical_name inválido")
@@ -1828,9 +1821,92 @@ def label_line_item(
             )
 
     session.add(line_item)
+    return catalog_item, alias_label
+
+
+@app.post("/api/tenants/{tenant_id}/line-items/{line_item_id}/label", response_model=InvoiceLineItemBase)
+def label_line_item(
+    tenant_id: str,
+    line_item_id: UUID,
+    payload: LineItemLabelRequest,
+    session: Session = Depends(get_session),
+):
+    tenant_id = require_tenant(tenant_id)
+    line_item = session.get(InvoiceLineItem, line_item_id)
+    if not line_item:
+        raise HTTPException(status_code=404, detail="Linha não encontrada")
+    invoice = session.get(Invoice, line_item.invoice_id)
+    if not invoice or invoice.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Linha não encontrada para este tenant")
+
+    _apply_label_to_line_item(tenant_id=tenant_id, line_item=line_item, payload=payload, session=session)
     session.commit()
     session.refresh(line_item)
     return line_item
+
+
+@app.post("/api/tenants/{tenant_id}/line-items/{line_item_id}/label-bulk", response_model=LineItemBulkLabelResponse)
+def label_line_item_bulk(
+    tenant_id: str,
+    line_item_id: UUID,
+    payload: LineItemLabelRequest,
+    scope: str = "vendor",
+    session: Session = Depends(get_session),
+):
+    tenant_id = require_tenant(tenant_id)
+    if scope not in {"vendor", "tenant"}:
+        raise HTTPException(status_code=400, detail="scope inválido (use vendor ou tenant)")
+
+    line_item = session.get(InvoiceLineItem, line_item_id)
+    if not line_item:
+        raise HTTPException(status_code=404, detail="Linha não encontrada")
+    invoice = session.get(Invoice, line_item.invoice_id)
+    if not invoice or invoice.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Linha não encontrada para este tenant")
+
+    catalog_item, alias_label = _apply_label_to_line_item(
+        tenant_id=tenant_id,
+        line_item=line_item,
+        payload=payload,
+        session=session,
+    )
+
+    if alias_label:
+        query = (
+            session.query(InvoiceLineItem, Invoice)
+            .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+            .filter(
+                Invoice.tenant_id == tenant_id,
+                InvoiceLineItem.id != line_item.id,
+                InvoiceLineItem.needs_review.is_(True),
+                InvoiceLineItem.description.isnot(None),
+            )
+        )
+        if scope == "vendor":
+            query = query.filter(Invoice.vendor == invoice.vendor)
+
+        updated_count = 1
+        for candidate, _candidate_invoice in query.limit(1000).all():
+            candidate_alias_label = normalize_catalog_lookup_label(candidate.description or "")
+            if candidate_alias_label != alias_label:
+                continue
+            candidate.catalog_item_id = catalog_item.id
+            if payload.line_type:
+                candidate.line_type = payload.line_type
+            if payload.line_category:
+                candidate.line_category = payload.line_category
+            if payload.normalized_unit:
+                candidate.normalized_unit = payload.normalized_unit
+            candidate.normalization_confidence = Decimal("0.99")
+            candidate.needs_review = False
+            candidate.review_reason = None
+            session.add(candidate)
+            updated_count += 1
+    else:
+        updated_count = 1
+
+    session.commit()
+    return {"line_item_id": line_item.id, "updated_count": updated_count}
 
 
 @app.get("/api/tenants/{tenant_id}/cost-trends", response_model=CostTrendResponse)
