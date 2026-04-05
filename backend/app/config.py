@@ -1,23 +1,21 @@
 from functools import lru_cache
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    database_url: str = Field(
-        "postgresql+psycopg2://viacontab:viacontab@postgres:5432/viacontab",
-        env="DATABASE_URL",
-    )
-    qdrant_url: str = Field("http://qdrant:6333", env="QDRANT_URL")
-    openai_api_key: str = Field("", env="OPENAI_API_KEY")
-    extraction_model: str = Field("gpt-4.1-nano", env="EXTRACTION_MODEL")
-    embedding_model: str = Field("text-embedding-3-small", env="EMBEDDING_MODEL")
-    debug_learning: bool = Field(False, env="DEBUG_LEARNING")
-    allowed_origins: list[str] = Field(default_factory=lambda: ["*"])
+    model_config = SettingsConfigDict(env_file=".env")
 
-    class Config:
-        env_file = ".env"
+    database_url: str = "postgresql+psycopg2://viacontab:viacontab@postgres:5432/viacontab"
+    qdrant_url: str = "http://qdrant:6333"
+    openai_api_key: str = ""
+    nif_lookup_key: str = Field("", validation_alias="NIF_PT_API_KEY")
+    extraction_model: str = "gpt-5.4-mini"
+    embedding_model: str = "text-embedding-3-small"
+    debug_learning: bool = False
+    skip_db_init: bool = False
+    allowed_origins: list[str] = Field(default_factory=lambda: ["*"])
 
 
 @lru_cache

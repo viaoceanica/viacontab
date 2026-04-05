@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
+import time
 import re
 import unicodedata
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any, List
 from uuid import UUID
 
@@ -11,38 +18,110 @@ import json
 import os
 import zipfile
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
 from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session, selectinload
 
 from .config import get_settings
-from .database import engine, get_session
+from .database import engine, get_session, SessionLocal
 from .embeddings import search_invoice_embeddings, upsert_invoice_embedding
-from .models import Base, Invoice, InvoiceCorrection, InvoiceLineItem, InvoiceTemplate, VendorProfile, TenantProfile
-from .processing import build_extraction_from_text, extract_invoice_data
+from .models import Base, CatalogAlias, CatalogItem, FailedImport, Invoice, InvoiceCorrection, InvoiceLineItem, InvoiceTemplate, VendorProfile, TenantProfile
+from .processing import (
+    _lookup_vendor_name_from_nif,
+    _lookup_vendor_profile_from_nif,
+    build_extraction_from_text,
+    extract_invoice_data,
+    precheck_invoice_candidate,
+    InvalidDocumentError,
+)
 from .schemas import (
+    CostTrendPoint,
+    CostTrendResponse,
+    CostTrendSummary,
     InvoiceBase,
     InvoiceCorrectionListResponse,
     InvoiceCorrectionRequest,
     ChatRequest,
     ChatResponse,
+    AutomationBlockerListResponse,
+    AutomationBlockerRow,
+    FailedImportBase,
+    FailedImportListResponse,
     IngestResponse,
+    InvoiceLineItemBase,
+    LineItemReviewListResponse,
+    LineItemLabelRequest,
+    LineItemReviewRow,
     InvoiceListResponse,
     InvoiceUpdateRequest,
+    RejectedDocument,
     TenantProfileRequest,
     TenantProfileResponse,
 )
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-Base.metadata.create_all(bind=engine)
+
+WATCHTOWER_LOCK = threading.Lock()
+WATCHTOWER_ACTIVE: dict[str, dict[str, Any]] = {}
+WATCHTOWER_RECENT: deque[dict[str, Any]] = deque(maxlen=500)
+
+
+def _watchtower_start(task_id: str, tenant_id: str, filename: str) -> None:
+    with WATCHTOWER_LOCK:
+        WATCHTOWER_ACTIVE[task_id] = {
+            "task_id": task_id,
+            "tenant_id": tenant_id,
+            "filename": filename,
+            "stage": "queued",
+            "started_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "status": "running",
+            "reason": None,
+            "duration_seconds": 0.0,
+        }
+
+
+def _watchtower_stage(task_id: str, stage: str) -> None:
+    with WATCHTOWER_LOCK:
+        payload = WATCHTOWER_ACTIVE.get(task_id)
+        if not payload:
+            return
+        payload["stage"] = stage
+        payload["updated_at"] = datetime.utcnow().isoformat()
+
+
+def _watchtower_finish(task_id: str, status: str, reason: str | None = None) -> None:
+    with WATCHTOWER_LOCK:
+        payload = WATCHTOWER_ACTIVE.pop(task_id, None)
+        if not payload:
+            return
+        started = datetime.fromisoformat(payload["started_at"])
+        payload["updated_at"] = datetime.utcnow().isoformat()
+        payload["status"] = status
+        payload["reason"] = reason
+        payload["duration_seconds"] = round((datetime.utcnow() - started).total_seconds(), 2)
+        WATCHTOWER_RECENT.appendleft(payload)
+
+
+def _watchtower_snapshot() -> dict[str, Any]:
+    now = datetime.utcnow()
+    with WATCHTOWER_LOCK:
+        active = []
+        for payload in WATCHTOWER_ACTIVE.values():
+            started = datetime.fromisoformat(payload["started_at"])
+            active_payload = dict(payload)
+            active_payload["duration_seconds"] = round((now - started).total_seconds(), 2)
+            active.append(active_payload)
+        recent = list(WATCHTOWER_RECENT)
+    return {"active": active, "recent": recent}
 
 MISSING_INVOICE_COLUMNS = {
-    "supplier_nif": "ALTER TABLE invoices ADD COLUMN supplier_nif VARCHAR(32)",
+    "supplier_nif": "ALTER TABLE invoices ADD COLUMN supplier_nif VARCHAR(128)",
     "customer_name": "ALTER TABLE invoices ADD COLUMN customer_name VARCHAR(255)",
-    "customer_nif": "ALTER TABLE invoices ADD COLUMN customer_nif VARCHAR(32)",
+    "customer_nif": "ALTER TABLE invoices ADD COLUMN customer_nif VARCHAR(128)",
     "invoice_number": "ALTER TABLE invoices ADD COLUMN invoice_number VARCHAR(128)",
     "invoice_date": "ALTER TABLE invoices ADD COLUMN invoice_date VARCHAR(32)",
     "due_date": "ALTER TABLE invoices ADD COLUMN due_date VARCHAR(32)",
@@ -50,12 +129,31 @@ MISSING_INVOICE_COLUMNS = {
     "raw_text": "ALTER TABLE invoices ADD COLUMN raw_text TEXT",
     "ai_payload": "ALTER TABLE invoices ADD COLUMN ai_payload TEXT",
     "extraction_model": "ALTER TABLE invoices ADD COLUMN extraction_model VARCHAR(128)",
+    "token_input": "ALTER TABLE invoices ADD COLUMN token_input INTEGER",
+    "token_output": "ALTER TABLE invoices ADD COLUMN token_output INTEGER",
+    "token_total": "ALTER TABLE invoices ADD COLUMN token_total INTEGER",
+    "confidence_score": "ALTER TABLE invoices ADD COLUMN confidence_score NUMERIC(5, 2)",
+    "requires_review": "ALTER TABLE invoices ADD COLUMN requires_review BOOLEAN DEFAULT FALSE",
     "learning_debug": "ALTER TABLE invoices ADD COLUMN learning_debug TEXT",
 }
 
 MISSING_TENANT_PROFILE_COLUMNS = {
     "company_name": "ALTER TABLE tenant_profiles ADD COLUMN company_name VARCHAR(255)",
-    "company_nif": "ALTER TABLE tenant_profiles ADD COLUMN company_nif VARCHAR(32)",
+    "company_nif": "ALTER TABLE tenant_profiles ADD COLUMN company_nif VARCHAR(128)",
+}
+
+COLUMN_LENGTH_REQUIREMENTS = {
+    ("invoices", "supplier_nif"): 128,
+    ("invoices", "customer_nif"): 128,
+    ("invoice_templates", "supplier_nif"): 128,
+    ("vendor_profiles", "supplier_nif"): 128,
+    ("tenant_profiles", "company_nif"): 128,
+}
+
+
+TEXT_COLUMN_REQUIREMENTS = {
+    ("invoice_line_items", "description"),
+    ("invoice_line_items", "normalized_description"),
 }
 
 
@@ -63,6 +161,19 @@ MISSING_LINE_ITEM_COLUMNS = {
     "code": "ALTER TABLE invoice_line_items ADD COLUMN code VARCHAR(128)",
     "line_subtotal": "ALTER TABLE invoice_line_items ADD COLUMN line_subtotal NUMERIC(12, 2)",
     "line_tax_amount": "ALTER TABLE invoice_line_items ADD COLUMN line_tax_amount NUMERIC(12, 2)",
+    "tax_rate_source": "ALTER TABLE invoice_line_items ADD COLUMN tax_rate_source VARCHAR(32)",
+    "normalized_description": "ALTER TABLE invoice_line_items ADD COLUMN normalized_description TEXT",
+    "catalog_item_id": "ALTER TABLE invoice_line_items ADD COLUMN catalog_item_id UUID",
+    "raw_unit": "ALTER TABLE invoice_line_items ADD COLUMN raw_unit VARCHAR(32)",
+    "normalized_unit": "ALTER TABLE invoice_line_items ADD COLUMN normalized_unit VARCHAR(32)",
+    "measurement_type": "ALTER TABLE invoice_line_items ADD COLUMN measurement_type VARCHAR(32)",
+    "normalized_quantity": "ALTER TABLE invoice_line_items ADD COLUMN normalized_quantity NUMERIC(12, 3)",
+    "normalized_unit_price": "ALTER TABLE invoice_line_items ADD COLUMN normalized_unit_price NUMERIC(12, 4)",
+    "line_category": "ALTER TABLE invoice_line_items ADD COLUMN line_category VARCHAR(64)",
+    "line_type": "ALTER TABLE invoice_line_items ADD COLUMN line_type VARCHAR(32)",
+    "normalization_confidence": "ALTER TABLE invoice_line_items ADD COLUMN normalization_confidence NUMERIC(5, 2)",
+    "needs_review": "ALTER TABLE invoice_line_items ADD COLUMN needs_review BOOLEAN DEFAULT FALSE",
+    "review_reason": "ALTER TABLE invoice_line_items ADD COLUMN review_reason TEXT",
 }
 
 
@@ -117,7 +228,83 @@ def ensure_invoice_columns() -> None:
                 connection.execute(text(ddl))
 
 
-ensure_invoice_columns()
+def ensure_column_lengths() -> None:
+    with engine.begin() as connection:
+        column_lengths = {
+            (row.table_name, row.column_name): row.character_maximum_length
+            for row in connection.execute(
+                text(
+                    """
+                    SELECT table_name, column_name, character_maximum_length
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                    """
+                )
+            )
+        }
+        for (table_name, column_name), required_length in COLUMN_LENGTH_REQUIREMENTS.items():
+            current_length = column_lengths.get((table_name, column_name))
+            if current_length is None:
+                continue
+            if current_length < required_length:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE VARCHAR({required_length})"
+                    )
+                )
+
+
+def ensure_text_columns() -> None:
+    with engine.begin() as connection:
+        column_types = {
+            (row.table_name, row.column_name): row.data_type
+            for row in connection.execute(
+                text(
+                    """
+                    SELECT table_name, column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                    """
+                )
+            )
+        }
+        for table_name, column_name in TEXT_COLUMN_REQUIREMENTS:
+            current_type = column_types.get((table_name, column_name))
+            if current_type is None or current_type == "text":
+                continue
+            connection.execute(
+                text(
+                    f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE TEXT"
+                )
+            )
+
+
+def initialize_database() -> None:
+    if settings.skip_db_init:
+        logger.info("Skipping database initialization because SKIP_DB_INIT=true")
+        return
+
+    Base.metadata.create_all(bind=engine)
+    ensure_invoice_columns()
+    ensure_column_lengths()
+    ensure_text_columns()
+
+
+def enqueue_invoice_embedding_job(invoice_id: UUID) -> None:
+    session = SessionLocal()
+    try:
+        invoice = session.get(
+            Invoice,
+            invoice_id,
+            options=(selectinload(Invoice.line_items),),
+        )
+        if not invoice:
+            return
+        upsert_invoice_embedding(invoice)
+    except Exception as exc:
+        logger.warning("Falha ao processar embedding da fatura %s em background: %s", invoice_id, exc)
+    finally:
+        session.close()
 
 
 def get_or_create_tenant_profile(tenant_id: str, session: Session) -> TenantProfile:
@@ -143,6 +330,63 @@ def apply_tenant_defaults_to_extraction(extraction: dict[str, Any], tenant_id: s
     return extraction
 
 
+def apply_counterparty_nif_heuristics(extraction: dict[str, Any], tenant_id: str, session: Session) -> dict[str, Any]:
+    profile = get_or_create_tenant_profile(tenant_id, session)
+    tenant_nif = normalize_digits(profile.company_nif)
+    supplier_nif = normalize_digits(extraction.get("supplier_nif"))
+    raw_text = str(extraction.get("raw_text") or "")
+
+    if not tenant_nif or not raw_text:
+        return extraction
+
+    candidate_nifs = []
+    for match in re.findall(r"\b\d{9}\b", raw_text):
+        digits = normalize_digits(match)
+        if digits and digits != tenant_nif and digits not in candidate_nifs:
+            candidate_nifs.append(digits)
+
+    if supplier_nif == tenant_nif and candidate_nifs:
+        corrected_supplier_nif = candidate_nifs[0]
+        extraction["supplier_nif"] = corrected_supplier_nif
+        extraction["customer_nif"] = tenant_nif
+        looked_up_vendor = _lookup_vendor_name_from_nif(corrected_supplier_nif)
+        tenant_name = normalize_label(profile.company_name)
+        current_vendor = normalize_label(extraction.get("vendor"))
+        if looked_up_vendor and (not current_vendor or current_vendor == tenant_name):
+            extraction["vendor"] = looked_up_vendor
+
+    return extraction
+
+
+def apply_vendor_profile_enrichment(extraction: dict[str, Any], tenant_id: str, session: Session) -> dict[str, Any]:
+    supplier_nif = normalize_digits(extraction.get("supplier_nif"))
+    if not supplier_nif:
+        return extraction
+
+    profile = _lookup_vendor_profile_from_nif(supplier_nif)
+    if not profile:
+        return extraction
+
+    tenant_profile = get_or_create_tenant_profile(tenant_id, session)
+    tenant_name = normalize_label(tenant_profile.company_name)
+    current_vendor = normalize_label(extraction.get("vendor"))
+    profile_name = str(profile.get("name") or "").strip()
+    profile_address = str(profile.get("address") or "").strip() or None
+
+    if profile_name and (not current_vendor or current_vendor == tenant_name):
+        extraction["vendor"] = profile_name
+    if profile_address and not str(extraction.get("vendor_address") or "").strip():
+        extraction["vendor_address"] = profile_address
+
+    if profile_name or profile_address:
+        marker = "NIF_PROFILE_ENRICHED"
+        existing_notes = str(extraction.get("notes") or "").strip()
+        if marker not in existing_notes:
+            extraction["notes"] = f"{existing_notes} | {marker}" if existing_notes else marker
+
+    return extraction
+
+
 def apply_extraction_to_invoice(invoice: Invoice, extraction: dict[str, Any], session: Session) -> None:
     invoice.vendor = extraction.get("vendor")
     invoice.vendor_address = extraction.get("vendor_address")
@@ -161,22 +405,48 @@ def apply_extraction_to_invoice(invoice: Invoice, extraction: dict[str, Any], se
     invoice.raw_text = extraction.get("raw_text")
     invoice.ai_payload = extraction.get("ai_payload")
     invoice.extraction_model = extraction.get("extraction_model")
+    invoice.token_input = extraction.get("token_input")
+    invoice.token_output = extraction.get("token_output")
+    invoice.token_total = extraction.get("token_total")
+    invoice.confidence_score = extraction.get("confidence_score")
+    invoice.requires_review = bool(extraction.get("requires_review", False))
     invoice.notes = extraction.get("notes")
+    default_tax_rate = infer_default_tax_rate(invoice.subtotal, invoice.tax)
 
     session.query(InvoiceLineItem).filter(InvoiceLineItem.invoice_id == invoice.id).delete()
     for item in extraction.get("line_items", []):
+        enriched = enrich_line_item_payload(
+            item,
+            tenant_id=invoice.tenant_id,
+            session=session,
+            default_tax_rate=default_tax_rate,
+            vendor_name=invoice.vendor,
+        )
         session.add(
             InvoiceLineItem(
                 invoice_id=invoice.id,
-                position=item.get("position"),
-                code=item.get("code"),
-                description=item.get("description"),
-                quantity=item.get("quantity"),
-                unit_price=item.get("unit_price"),
-                line_subtotal=item.get("line_subtotal"),
-                line_tax_amount=item.get("line_tax_amount"),
-                line_total=item.get("line_total"),
-                tax_rate=item.get("tax_rate"),
+                position=enriched.get("position"),
+                code=enriched.get("code"),
+                description=enriched.get("description"),
+                normalized_description=enriched.get("normalized_description"),
+                quantity=enriched.get("quantity"),
+                unit_price=enriched.get("unit_price"),
+                line_subtotal=enriched.get("line_subtotal"),
+                line_tax_amount=enriched.get("line_tax_amount"),
+                line_total=enriched.get("line_total"),
+                tax_rate=enriched.get("tax_rate"),
+                tax_rate_source=enriched.get("tax_rate_source"),
+                catalog_item_id=enriched.get("catalog_item_id"),
+                raw_unit=enriched.get("raw_unit"),
+                normalized_unit=enriched.get("normalized_unit"),
+                measurement_type=enriched.get("measurement_type"),
+                normalized_quantity=enriched.get("normalized_quantity"),
+                normalized_unit_price=enriched.get("normalized_unit_price"),
+                line_category=enriched.get("line_category"),
+                line_type=enriched.get("line_type"),
+                normalization_confidence=enriched.get("normalization_confidence"),
+                needs_review=bool(enriched.get("needs_review", False)),
+                review_reason=enriched.get("review_reason"),
             )
         )
 
@@ -196,6 +466,442 @@ def normalize_digits(value: str | None) -> str | None:
         return None
     digits = re.sub(r"\D+", "", value)
     return digits or None
+
+
+def normalize_label(value: str | None) -> str:
+    if not value:
+        return ""
+    lowered = unicodedata.normalize("NFKD", value)
+    lowered = "".join(char for char in lowered if not unicodedata.combining(char))
+    lowered = lowered.lower()
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+CATALOG_NOISE_TOKENS = {
+    "invoice",
+    "fatura",
+    "factura",
+    "period",
+    "periodo",
+    "periodo",
+    "from",
+    "to",
+    "de",
+    "a",
+    "usd",
+    "eur",
+    "iva",
+    "tax",
+}
+
+GENERIC_CATALOG_TOKENS = {
+    "item",
+    "items",
+    "produto",
+    "product",
+    "servico",
+    "service",
+    "mensalidade",
+    "subscription",
+    "linha",
+}
+
+
+def normalize_catalog_lookup_label(value: str | None) -> str:
+    normalized = normalize_label(value)
+    if not normalized:
+        return ""
+    filtered: list[str] = []
+    for token in normalized.split():
+        if token in CATALOG_NOISE_TOKENS:
+            continue
+        if re.fullmatch(r"\d+", token):
+            continue
+        if re.fullmatch(r"\d{4}\d{2}\d{2}", token):
+            continue
+        if len(token) <= 1:
+            continue
+        filtered.append(token)
+    if not filtered:
+        return normalized
+    return " ".join(filtered[:8])
+
+
+def infer_line_measurement(description: str, quantity: Decimal | None) -> tuple[str | None, str | None]:
+    text_value = normalize_label(description)
+    if re.search(r"\b(hora|horas|hour|hours|hr|hrs)\b", text_value):
+        return "hour", "per_hour"
+    if re.search(r"\b(kg|quilo|quilos|kilo|kilos)\b", text_value):
+        return "kg", "per_kg"
+    if re.search(r"\b(l|lt|litro|litros|liter|liters)\b", text_value):
+        return "l", "per_liter"
+    if quantity is not None:
+        return "unit", "per_unit"
+    return None, None
+
+
+def infer_line_type(description: str) -> tuple[str, str | None]:
+    normalized = normalize_label(description)
+    if any(token in normalized for token in ["desconto", "discount", "rebate", "credito", "credit"]):
+        return "discount", "adjustments/discount"
+    if any(token in normalized for token in ["fee", "taxa", "comissao", "comissão", "surcharge"]):
+        return "fee", "services/fees"
+    if any(token in normalized for token in ["iva", "tax", "imposto"]):
+        return "tax_only", "tax"
+    if any(token in normalized for token in ["porte", "frete", "shipping", "transporte"]):
+        return "shipping", "logistics"
+    if any(token in normalized for token in ["mensal", "subscricao", "subscription", "license", "licenca"]):
+        return "subscription", "services/subscription"
+    if any(token in normalized for token in ["servico", "service", "assistencia", "consultoria", "manutencao"]):
+        return "service", "services"
+    return "product", "goods"
+
+
+def infer_normalized_unit_price(
+    quantity: Decimal | None,
+    unit_price: Decimal | None,
+    line_subtotal: Decimal | None,
+    line_total: Decimal | None,
+) -> Decimal | None:
+    if unit_price is not None:
+        return unit_price
+    base = line_subtotal if line_subtotal is not None else line_total
+    if base is None or quantity in (None, Decimal("0")):
+        return None
+
+
+def infer_default_tax_rate(subtotal: Decimal | None, tax: Decimal | None) -> Decimal | None:
+    if subtotal in (None, Decimal("0")) or tax is None:
+        return None
+    try:
+        rate = ((tax / subtotal) * Decimal("100")).quantize(Decimal("0.01"))
+    except Exception:
+        return None
+    if rate < Decimal("0") or rate > Decimal("100"):
+        return None
+    return rate
+    try:
+        return (base / quantity).quantize(Decimal("0.0001"))
+    except Exception:
+        return None
+
+
+def find_or_create_catalog_item(
+    tenant_id: str,
+    normalized_description: str,
+    line_type: str,
+    measurement_type: str | None,
+    normalized_unit: str | None,
+    vendor_name: str | None,
+    session: Session,
+) -> tuple[CatalogItem | None, Decimal]:
+    def _token_similarity(left: str, right: str) -> Decimal:
+        left_tokens = set(left.split())
+        right_tokens = set(right.split())
+        if not left_tokens or not right_tokens:
+            return Decimal("0")
+        inter = len(left_tokens & right_tokens)
+        union = len(left_tokens | right_tokens)
+        if union == 0:
+            return Decimal("0")
+        return (Decimal(inter) / Decimal(union)).quantize(Decimal("0.01"))
+
+    if not normalized_description:
+        return None, Decimal("0")
+
+    normalized_vendor = normalize_label(vendor_name)
+
+    def _vendor_preference_for_catalog_ids(catalog_ids: list[UUID]) -> dict[UUID, Decimal]:
+        if not normalized_vendor or not catalog_ids:
+            return {}
+        rows = (
+            session.query(InvoiceLineItem.catalog_item_id, func.count(InvoiceLineItem.id))
+            .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+            .filter(
+                Invoice.tenant_id == tenant_id,
+                InvoiceLineItem.catalog_item_id.in_(catalog_ids),
+                func.lower(func.coalesce(Invoice.vendor, "")) == normalized_vendor,
+            )
+            .group_by(InvoiceLineItem.catalog_item_id)
+            .all()
+        )
+        return {catalog_id: Decimal("0.10") for catalog_id, count in rows if catalog_id and count > 0}
+
+    alias = (
+        session.query(CatalogAlias)
+        .join(CatalogItem, CatalogAlias.catalog_item_id == CatalogItem.id)
+        .filter(CatalogAlias.tenant_id == tenant_id, CatalogAlias.normalized_label == normalized_description)
+        .one_or_none()
+    )
+    if alias:
+        return alias.catalog_item, Decimal("0.95")
+
+    aliases = (
+        session.query(CatalogAlias)
+        .join(CatalogItem, CatalogAlias.catalog_item_id == CatalogItem.id)
+        .filter(CatalogAlias.tenant_id == tenant_id)
+        .all()
+    )
+    best_alias = None
+    best_alias_score = Decimal("0")
+    vendor_boost_by_alias_id = _vendor_preference_for_catalog_ids(
+        [candidate.catalog_item_id for candidate in aliases if candidate.catalog_item_id]
+    )
+    for candidate in aliases:
+        score = _token_similarity(normalized_description, candidate.normalized_label or "") + vendor_boost_by_alias_id.get(candidate.catalog_item_id, Decimal("0"))
+        if score > best_alias_score:
+            best_alias_score = score
+            best_alias = candidate
+    if best_alias and best_alias_score >= Decimal("0.75"):
+        return best_alias.catalog_item, Decimal("0.85")
+
+    canonical_name = " ".join(normalized_description.split()[:5]).strip()
+    if not canonical_name:
+        return None, Decimal("0")
+    canonical_tokens = canonical_name.split()
+    if len(canonical_tokens) < 2 or all(token in GENERIC_CATALOG_TOKENS for token in canonical_tokens):
+        return None, Decimal("0.40")
+
+    catalog_item = (
+        session.query(CatalogItem)
+        .filter(CatalogItem.tenant_id == tenant_id, CatalogItem.canonical_name == canonical_name)
+        .one_or_none()
+    )
+    if not catalog_item:
+        candidates = session.query(CatalogItem).filter(CatalogItem.tenant_id == tenant_id).all()
+        best_catalog = None
+        best_catalog_score = Decimal("0")
+        vendor_boost_by_catalog = _vendor_preference_for_catalog_ids([candidate.id for candidate in candidates])
+        for candidate in candidates:
+            score = _token_similarity(normalized_description, normalize_label(candidate.canonical_name)) + vendor_boost_by_catalog.get(candidate.id, Decimal("0"))
+            if score > best_catalog_score:
+                best_catalog_score = score
+                best_catalog = candidate
+        if best_catalog and best_catalog_score >= Decimal("0.70"):
+            alias = CatalogAlias(
+                tenant_id=tenant_id,
+                raw_label=normalized_description,
+                normalized_label=normalized_description,
+                catalog_item_id=best_catalog.id,
+                confidence=best_catalog_score,
+                source="auto-fuzzy",
+            )
+            session.add(alias)
+            session.flush()
+            return best_catalog, Decimal("0.78")
+
+    if not catalog_item:
+        catalog_item = CatalogItem(
+            tenant_id=tenant_id,
+            canonical_name=canonical_name,
+            display_name=canonical_name.title(),
+            category_path="services" if line_type == "service" else "goods",
+            item_type=line_type,
+            measurement_type=measurement_type,
+            base_unit=normalized_unit,
+        )
+        session.add(catalog_item)
+        session.flush()
+
+    alias = CatalogAlias(
+        tenant_id=tenant_id,
+        raw_label=normalized_description,
+        normalized_label=normalized_description,
+        catalog_item_id=catalog_item.id,
+        confidence=Decimal("0.60"),
+        source="auto",
+    )
+    session.add(alias)
+    session.flush()
+    return catalog_item, Decimal("0.60")
+
+
+def promote_manual_line_item_aliases(invoice: Invoice, session: Session) -> None:
+    for line in invoice.line_items or []:
+        if not line.catalog_item_id or not line.description:
+            continue
+        normalized_label = normalize_catalog_lookup_label(line.description)
+        if not normalized_label:
+            continue
+        alias = (
+            session.query(CatalogAlias)
+            .filter(
+                CatalogAlias.tenant_id == invoice.tenant_id,
+                CatalogAlias.normalized_label == normalized_label,
+            )
+            .one_or_none()
+        )
+        if alias:
+            alias.catalog_item_id = line.catalog_item_id
+            alias.raw_label = line.description
+            alias.confidence = Decimal("0.99")
+            alias.source = "manual"
+        else:
+            session.add(
+                CatalogAlias(
+                    tenant_id=invoice.tenant_id,
+                    raw_label=line.description,
+                    normalized_label=normalized_label,
+                    catalog_item_id=line.catalog_item_id,
+                    confidence=Decimal("0.99"),
+                    source="manual",
+                )
+            )
+
+
+def _to_decimal_safe(value: Any, quant: str | None = None) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        normalized = str(value).replace("€", "").replace(" ", "").replace(",", ".")
+        number = Decimal(normalized)
+        if quant:
+            number = number.quantize(Decimal(quant))
+        return number
+    except Exception:
+        return None
+
+
+def _repair_line_item_values(
+    *,
+    quantity: Decimal | None,
+    unit_price: Decimal | None,
+    line_subtotal: Decimal | None,
+    line_tax_amount: Decimal | None,
+    line_total: Decimal | None,
+) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None, Decimal | None, list[str]]:
+    issues: list[str] = []
+
+    if quantity is not None and quantity <= 0:
+        issues.append("quantity_non_positive")
+        quantity = None
+
+    if line_subtotal is None and line_total is not None and line_tax_amount is not None:
+        line_subtotal = (line_total - line_tax_amount).quantize(Decimal("0.01"))
+    if line_total is None and line_subtotal is not None and line_tax_amount is not None:
+        line_total = (line_subtotal + line_tax_amount).quantize(Decimal("0.01"))
+
+    if line_subtotal is None and quantity not in (None, Decimal("0")) and unit_price is not None:
+        line_subtotal = (quantity * unit_price).quantize(Decimal("0.01"))
+    if unit_price is None and quantity not in (None, Decimal("0")) and line_subtotal is not None:
+        unit_price = (line_subtotal / quantity).quantize(Decimal("0.0001"))
+    if quantity is None and unit_price not in (None, Decimal("0")) and line_subtotal is not None:
+        quantity = (line_subtotal / unit_price).quantize(Decimal("0.001"))
+
+    if line_total is None and line_subtotal is not None:
+        line_total = (line_subtotal + (line_tax_amount or Decimal("0"))).quantize(Decimal("0.01"))
+
+    if quantity is not None and unit_price is not None and line_subtotal is not None:
+        expected_subtotal = (quantity * unit_price).quantize(Decimal("0.01"))
+        if abs(expected_subtotal - line_subtotal) > Decimal("0.03"):
+            issues.append("subtotal_mismatch")
+
+    if line_total is not None and line_subtotal is not None and line_tax_amount is not None:
+        expected_total = (line_subtotal + line_tax_amount).quantize(Decimal("0.01"))
+        if abs(expected_total - line_total) > Decimal("0.03"):
+            issues.append("total_mismatch")
+
+    return quantity, unit_price, line_subtotal, line_tax_amount, line_total, issues
+
+
+def _format_review_reasons(issues: list[str]) -> str | None:
+    if not issues:
+        return None
+    labels = {
+        "quantity_non_positive": "quantidade inválida (<=0)",
+        "subtotal_mismatch": "subtotal inconsistente com qtd × preço",
+        "total_mismatch": "total inconsistente com subtotal + imposto",
+        "missing_description": "descrição em falta",
+        "missing_amounts": "valores de linha em falta",
+        "low_confidence_match": "classificação com confiança baixa",
+    }
+    rendered = [labels.get(issue, issue) for issue in dict.fromkeys(issues)]
+    return "; ".join(rendered)
+
+
+def enrich_line_item_payload(
+    item: dict[str, Any],
+    tenant_id: str,
+    session: Session,
+    default_tax_rate: Decimal | None = None,
+    vendor_name: str | None = None,
+) -> dict[str, Any]:
+    description = str(item.get("description") or "").strip()
+    normalized_description = normalize_label(description)
+    catalog_lookup_description = normalize_catalog_lookup_label(description)
+    quantity = _to_decimal_safe(item.get("quantity"), quant="0.001")
+    unit_price = _to_decimal_safe(item.get("unit_price"), quant="0.0001")
+    line_subtotal = _to_decimal_safe(item.get("line_subtotal"), quant="0.01")
+    line_tax_amount = _to_decimal_safe(item.get("line_tax_amount"), quant="0.01")
+    line_total = _to_decimal_safe(item.get("line_total"), quant="0.01")
+    tax_rate = _to_decimal_safe(item.get("tax_rate"), quant="0.01")
+    tax_rate_source = "extracted" if tax_rate is not None else None
+
+    quantity, unit_price, line_subtotal, line_tax_amount, line_total, issues = _repair_line_item_values(
+        quantity=quantity,
+        unit_price=unit_price,
+        line_subtotal=line_subtotal,
+        line_tax_amount=line_tax_amount,
+        line_total=line_total,
+    )
+    if not normalized_description:
+        issues.append("missing_description")
+    if line_total is None and line_subtotal is None:
+        issues.append("missing_amounts")
+
+    if tax_rate is None:
+        line_calculated = infer_default_tax_rate(line_subtotal, line_tax_amount)
+        if line_calculated is not None:
+            tax_rate = line_calculated
+            tax_rate_source = "calculated_line"
+        elif default_tax_rate is not None:
+            tax_rate = default_tax_rate
+            tax_rate_source = "calculated_invoice"
+
+    normalized_unit, measurement_type = infer_line_measurement(description, quantity)
+    line_type, line_category = infer_line_type(description)
+    normalized_unit_price = infer_normalized_unit_price(quantity, unit_price, line_subtotal, line_total)
+    catalog_item, confidence = find_or_create_catalog_item(
+        tenant_id=tenant_id,
+        normalized_description=catalog_lookup_description or normalized_description,
+        line_type=line_type,
+        measurement_type=measurement_type,
+        normalized_unit=normalized_unit,
+        vendor_name=vendor_name,
+        session=session,
+    )
+
+    normalized_confidence = confidence
+    if issues:
+        penalty = Decimal("0.12") * Decimal(len(set(issues)))
+        normalized_confidence = max(Decimal("0.20"), confidence - penalty).quantize(Decimal("0.01"))
+    if normalized_confidence < Decimal("0.78") and "low_confidence_match" not in issues:
+        issues.append("low_confidence_match")
+    review_reason = _format_review_reasons(issues)
+
+    return {
+        **item,
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "line_subtotal": line_subtotal,
+        "line_tax_amount": line_tax_amount,
+        "line_total": line_total,
+        "tax_rate": tax_rate,
+        "tax_rate_source": tax_rate_source,
+        "normalized_description": normalized_description or None,
+        "catalog_item_id": catalog_item.id if catalog_item else None,
+        "raw_unit": item.get("raw_unit") or normalized_unit,
+        "normalized_unit": normalized_unit,
+        "measurement_type": measurement_type,
+        "normalized_quantity": quantity,
+        "normalized_unit_price": normalized_unit_price,
+        "line_category": line_category,
+        "line_type": line_type,
+        "normalization_confidence": normalized_confidence,
+        "needs_review": normalized_confidence < Decimal("0.78") or bool(issues),
+        "review_reason": review_reason,
+    }
 
 
 def looks_like_instruction_text(value: str | None) -> bool:
@@ -337,6 +1043,8 @@ def apply_vendor_profile_to_extraction(
         "customer_name",
         "customer_nif",
     ]:
+        if extraction.get("qr_data") and field in {"supplier_nif", "customer_nif"}:
+            continue
         value = sanitize_learned_value(payload.get(field))
         if value:
             extraction[field] = value
@@ -413,7 +1121,7 @@ def score_template_match(
     elif normalized_invoice_number and template_invoice and (
         normalized_invoice_number in template_invoice or template_invoice in normalized_invoice_number
     ):
-        score += 70
+        score += 20
 
     if normalized_supplier_nif and template_nif == normalized_supplier_nif:
         score += 100
@@ -488,17 +1196,129 @@ def apply_template_to_extraction(
         debug["invoice_template_invoice_number"] = best_template.invoice_number if best_template else None
         debug["invoice_template_supplier_nif"] = best_template.supplier_nif if best_template else None
 
-    if not best_template or best_score < 100:
+    template_invoice_normalized = normalize_identifier(best_template.invoice_number) if best_template else None
+    has_invoice_number_match = bool(
+        normalized_invoice_number
+        and template_invoice_normalized
+        and normalized_invoice_number == template_invoice_normalized
+    )
+
+    if not best_template or best_score < 130 or not has_invoice_number_match:
         return extraction
 
     try:
         payload = json.loads(best_template.payload)
     except json.JSONDecodeError:
         return extraction
-    extraction.update(payload)
+
+    # When QR data is present, trust QR-derived fiscal identifiers and totals.
+    protected_when_qr = {
+        "supplier_nif",
+        "customer_nif",
+        "invoice_number",
+        "invoice_date",
+        "tax",
+        "total",
+    }
+
+    for field, value in payload.items():
+        if extraction.get("qr_data") and field in protected_when_qr:
+            continue
+        extraction[field] = value
+
     if debug is not None:
         debug["invoice_template_applied"] = True
     return extraction
+
+
+
+def _ensure_line_items(extraction: dict[str, Any], filename: str | None) -> list[dict[str, Any]]:
+    line_items = extraction.get("line_items") or []
+    if line_items:
+        return line_items
+    amount = extraction.get("subtotal")
+    if amount is None:
+        amount = extraction.get("total")
+    description = extraction.get("notes") or extraction.get("vendor") or filename or "documento"
+    fallback_total = extraction.get("total") if extraction.get("total") is not None else amount
+    quantity = Decimal("1.00") if fallback_total is not None else None
+    return [
+        {
+            "position": 1,
+            "code": extraction.get("invoice_number"),
+            "description": description,
+            "quantity": quantity,
+            "unit_price": amount,
+            "line_subtotal": amount,
+            "line_tax_amount": extraction.get("tax"),
+            "line_total": fallback_total,
+            "tax_rate": None,
+        }
+    ]
+
+
+def _is_empty_line_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return True
+    text_fields = ["description", "code"]
+    numeric_fields = ["quantity", "unit_price", "line_subtotal", "line_tax_amount", "line_total", "total", "subtotal"]
+
+    if any(str(item.get(field) or "").strip() for field in text_fields):
+        return False
+
+    for field in numeric_fields:
+        value = item.get(field)
+        if value is None or value == "":
+            continue
+        try:
+            if Decimal(str(value)) != Decimal("0"):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _has_meaningful_line_items(raw_line_items: Any) -> bool:
+    if not isinstance(raw_line_items, list) or not raw_line_items:
+        return False
+    return any(not _is_empty_line_item(item) for item in raw_line_items)
+
+
+def score_extraction_confidence(extraction: dict[str, Any]) -> tuple[Decimal, bool]:
+    score = Decimal("100")
+    missing_penalties = {
+        "vendor": Decimal("12"),
+        "invoice_number": Decimal("14"),
+        "invoice_date": Decimal("10"),
+        "total": Decimal("16"),
+        "supplier_nif": Decimal("10"),
+    }
+
+    for field, penalty in missing_penalties.items():
+        if not extraction.get(field):
+            score -= penalty
+
+    line_items = extraction.get("line_items") or []
+    if not line_items:
+        score -= Decimal("18")
+    elif len(line_items) == 1:
+        score -= Decimal("8")
+
+    if extraction.get("qr_data"):
+        score += Decimal("8")
+
+    detected_type = (extraction.get("detected_type") or "").lower()
+    if detected_type and "invoice" not in detected_type and "fatura" not in detected_type:
+        score -= Decimal("12")
+
+    raw_text = str(extraction.get("raw_text") or "")
+    if raw_text and len(raw_text) < 200:
+        score -= Decimal("8")
+
+    confidence = max(Decimal("0"), min(Decimal("100"), score)).quantize(Decimal("0.01"))
+    requires_review = confidence < Decimal("75")
+    return confidence, requires_review
+
 
 
 def upsert_invoice_template(invoice: Invoice, session: Session) -> None:
@@ -559,18 +1379,31 @@ def upsert_invoice_template(invoice: Invoice, session: Session) -> None:
         )
 
 
+MAX_ZIP_MEMBERS = 200
+MAX_ZIP_MEMBER_SIZE = 20 * 1024 * 1024  # 20 MB per file
+MAX_ZIP_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024  # 100 MB total
+MAX_FAILED_IMPORT_BLOB = 20 * 1024 * 1024  # 20 MB stored for retry
+
+
 def expand_zip_upload(upload: UploadFile) -> list[UploadFile]:
     buffer = upload.file.read()
     upload.file.seek(0)
     expanded: list[UploadFile] = []
+    total_uncompressed = 0
     try:
         with zipfile.ZipFile(io.BytesIO(buffer)) as archive:
-            for member in archive.namelist():
-                if member.endswith('/'):
-                    continue
+            members = [info for info in archive.infolist() if not info.is_dir()]
+            if len(members) > MAX_ZIP_MEMBERS:
+                raise HTTPException(status_code=400, detail=f'ZIP excede o limite de {MAX_ZIP_MEMBERS} ficheiros')
+            for member in members:
+                filename = os.path.basename(member.filename) or 'documento.zip'
+                if member.file_size > MAX_ZIP_MEMBER_SIZE:
+                    raise HTTPException(status_code=400, detail=f'Ficheiro {filename} excede o limite de 20 MB dentro do ZIP')
+                total_uncompressed += member.file_size
+                if total_uncompressed > MAX_ZIP_TOTAL_UNCOMPRESSED:
+                    raise HTTPException(status_code=400, detail='ZIP excede o limite total de 100 MB descomprimidos')
                 data = archive.read(member)
                 file_obj = io.BytesIO(data)
-                filename = os.path.basename(member) or 'documento.zip'
                 expanded.append(UploadFile(filename=filename, file=file_obj))
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=400, detail='Arquivo ZIP inválido') from exc
@@ -616,7 +1449,13 @@ def build_chat_answer(question: str, contexts: list[str]) -> str:
         return "Não consegui gerar uma resposta com os dados disponíveis."
 
 
-app = FastAPI(title="ViaContab API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    initialize_database()
+    yield
+
+
+app = FastAPI(title="ViaContab API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -625,16 +1464,181 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def require_tenant(tenant_id: str) -> str:
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id é obrigatório")
     return tenant_id
 
 
+def _read_upload_bytes(upload: UploadFile) -> bytes:
+    upload.file.seek(0)
+    content = upload.file.read()
+    upload.file.seek(0)
+    return content
+
+
+def persist_failed_import(
+    session: Session,
+    *,
+    tenant_id: str,
+    filename: str,
+    reason: str,
+    detected_type: str | None = None,
+    source: str = "upload",
+    mime_type: str | None = None,
+    file_bytes: bytes | None = None,
+) -> FailedImport:
+    stored_blob = file_bytes
+    if stored_blob is not None and len(stored_blob) > MAX_FAILED_IMPORT_BLOB:
+        stored_blob = None
+        reason = f"{reason} (ficheiro excede 20MB e não foi guardado para retry automático)"
+
+    failed = FailedImport(
+        tenant_id=tenant_id,
+        filename=filename,
+        mime_type=mime_type,
+        file_size=len(file_bytes) if file_bytes is not None else None,
+        file_blob=stored_blob,
+        reason=reason,
+        detected_type=detected_type,
+        source=source,
+    )
+    session.add(failed)
+    session.flush()
+    return failed
+
+
+def compute_invoice_blockers(invoice: Invoice) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+
+    subtotal = Decimal(str(invoice.subtotal)) if invoice.subtotal is not None else None
+    tax = Decimal(str(invoice.tax)) if invoice.tax is not None else None
+    total = Decimal(str(invoice.total)) if invoice.total is not None else None
+    if subtotal is not None and tax is not None and total is not None:
+        expected_total = (subtotal + tax).quantize(Decimal("0.01"))
+        if abs(expected_total - total) > Decimal("0.03"):
+            blockers.append(
+                {
+                    "code": "totals_mismatch",
+                    "severity": "error",
+                    "message": "Total da fatura não fecha com subtotal + imposto",
+                }
+            )
+
+    supplier_nif = normalize_digits(invoice.supplier_nif)
+    customer_nif = normalize_digits(invoice.customer_nif)
+    if supplier_nif and customer_nif and supplier_nif == customer_nif:
+        blockers.append(
+            {
+                "code": "supplier_customer_same_nif",
+                "severity": "error",
+                "message": "NIF do fornecedor e cliente coincidem",
+            }
+        )
+
+    if invoice.requires_review:
+        blockers.append(
+            {
+                "code": "document_requires_review",
+                "severity": "warning",
+                "message": "Documento marcado para revisão manual",
+            }
+        )
+
+    if invoice.confidence_score is not None and Decimal(str(invoice.confidence_score)) < Decimal("85"):
+        blockers.append(
+            {
+                "code": "low_confidence_document",
+                "severity": "warning",
+                "message": "Confiança global baixa (<85)",
+            }
+        )
+
+    line_review_count = sum(1 for line in (invoice.line_items or []) if getattr(line, "needs_review", False))
+    if line_review_count > 0:
+        blockers.append(
+            {
+                "code": "line_items_need_review",
+                "severity": "warning",
+                "message": f"{line_review_count} linha(s) com revisão pendente",
+            }
+        )
+
+    qr_detected = "QR português detetado" in str(invoice.notes or "")
+    if str(invoice.filename or "").lower().endswith(".pdf") and not qr_detected and not supplier_nif:
+        blockers.append(
+            {
+                "code": "qr_or_supplier_missing",
+                "severity": "warning",
+                "message": "Sem QR/NIF de fornecedor detetado",
+            }
+        )
+
+    if "DUPLICATE_CANDIDATE" in str(invoice.notes or ""):
+        blockers.append(
+            {
+                "code": "duplicate_candidate",
+                "severity": "error",
+                "message": "Possível fatura duplicada",
+            }
+        )
+
+    return blockers
+
+
+def find_potential_duplicate_invoice(
+    *,
+    tenant_id: str,
+    supplier_nif: str | None,
+    invoice_number: str | None,
+    total: Decimal | None,
+    session: Session,
+) -> Invoice | None:
+    normalized_supplier_nif = normalize_digits(supplier_nif)
+    normalized_invoice_number = normalize_label(invoice_number)
+    if not normalized_invoice_number or total is None:
+        return None
+
+    candidates = (
+        session.query(Invoice)
+        .filter(
+            Invoice.tenant_id == tenant_id,
+            Invoice.total == total,
+            Invoice.invoice_number.isnot(None),
+        )
+        .order_by(Invoice.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    for candidate in candidates:
+        candidate_invoice_number = normalize_label(candidate.invoice_number)
+        if candidate_invoice_number != normalized_invoice_number:
+            continue
+        candidate_supplier_nif = normalize_digits(candidate.supplier_nif)
+        if normalized_supplier_nif and candidate_supplier_nif and candidate_supplier_nif != normalized_supplier_nif:
+            continue
+        return candidate
+    return None
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "viacontab-backend"}
+
+
+@app.get("/api/watchtower/uploads")
+def watchtower_uploads():
+    snapshot = _watchtower_snapshot()
+    active = snapshot["active"]
+    for payload in active:
+        payload["stuck"] = payload.get("duration_seconds", 0) > 90
+    return {"ok": True, **snapshot}
+
+
+@app.get("/api/ready")
+def ready(session: Session = Depends(get_session)):
+    session.execute(text("SELECT 1"))
+    return {"ok": True, "service": "viacontab-backend", "ready": True}
 
 
 @app.get("/api/tenants/{tenant_id}/profile", response_model=TenantProfileResponse)
@@ -672,6 +1676,261 @@ def list_invoices(tenant_id: str, session: Session = Depends(get_session)):
     return {"items": [serialize_invoice(invoice) for invoice in invoices]}
 
 
+@app.get("/api/tenants/{tenant_id}/failed-imports", response_model=FailedImportListResponse)
+def list_failed_imports(tenant_id: str, session: Session = Depends(get_session)):
+    tenant_id = require_tenant(tenant_id)
+    rows = (
+        session.query(FailedImport)
+        .filter(FailedImport.tenant_id == tenant_id)
+        .order_by(FailedImport.created_at.desc())
+        .all()
+    )
+    return {
+        "items": [FailedImportBase.model_validate(row).model_dump(mode="json") for row in rows]
+    }
+
+
+@app.get("/api/tenants/{tenant_id}/automation-blockers", response_model=AutomationBlockerListResponse)
+def list_automation_blockers(tenant_id: str, limit: int = 200, session: Session = Depends(get_session)):
+    tenant_id = require_tenant(tenant_id)
+    invoices = (
+        session.query(Invoice)
+        .options(joinedload(Invoice.line_items))
+        .filter(Invoice.tenant_id == tenant_id)
+        .order_by(Invoice.created_at.desc())
+        .limit(max(20, min(limit, 1000)))
+        .all()
+    )
+    items: list[AutomationBlockerRow] = []
+    for invoice in invoices:
+        blockers = compute_invoice_blockers(invoice)
+        for blocker in blockers:
+            items.append(
+                AutomationBlockerRow(
+                    invoice_id=invoice.id,
+                    invoice_number=invoice.invoice_number,
+                    filename=invoice.filename,
+                    vendor=invoice.vendor,
+                    code=blocker["code"],
+                    severity=blocker["severity"],
+                    message=blocker["message"],
+                    created_at=invoice.created_at,
+                )
+            )
+    return {"items": [item.model_dump(mode="json") for item in items]}
+
+
+@app.get("/api/tenants/{tenant_id}/line-items/review", response_model=LineItemReviewListResponse)
+def list_line_items_for_review(tenant_id: str, limit: int = 200, session: Session = Depends(get_session)):
+    tenant_id = require_tenant(tenant_id)
+    limit = max(20, min(limit, 1000))
+    rows = (
+        session.query(InvoiceLineItem, Invoice)
+        .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+        .filter(Invoice.tenant_id == tenant_id, InvoiceLineItem.needs_review.is_(True))
+        .order_by(Invoice.created_at.desc(), InvoiceLineItem.position.asc())
+        .limit(limit)
+        .all()
+    )
+    items = [
+        LineItemReviewRow(
+            invoice_id=invoice.id,
+            invoice_number=invoice.invoice_number,
+            vendor=invoice.vendor,
+            filename=invoice.filename,
+            created_at=invoice.created_at,
+            line_item_id=line.id,
+            position=line.position,
+            description=line.description,
+            line_total=line.line_total,
+            tax_rate=line.tax_rate,
+            tax_rate_source=getattr(line, "tax_rate_source", None),
+            normalization_confidence=line.normalization_confidence,
+            review_reason=getattr(line, "review_reason", None),
+        )
+        for line, invoice in rows
+    ]
+    return {"items": [item.model_dump(mode="json") for item in items]}
+
+
+@app.post("/api/tenants/{tenant_id}/line-items/{line_item_id}/label", response_model=InvoiceLineItemBase)
+def label_line_item(
+    tenant_id: str,
+    line_item_id: UUID,
+    payload: LineItemLabelRequest,
+    session: Session = Depends(get_session),
+):
+    tenant_id = require_tenant(tenant_id)
+    line_item = session.get(InvoiceLineItem, line_item_id)
+    if not line_item:
+        raise HTTPException(status_code=404, detail="Linha não encontrada")
+    invoice = session.get(Invoice, line_item.invoice_id)
+    if not invoice or invoice.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Linha não encontrada para este tenant")
+
+    canonical_name = normalize_catalog_lookup_label(payload.canonical_name)
+    if not canonical_name:
+        raise HTTPException(status_code=400, detail="canonical_name inválido")
+
+    catalog_item = (
+        session.query(CatalogItem)
+        .filter(CatalogItem.tenant_id == tenant_id, CatalogItem.canonical_name == canonical_name)
+        .one_or_none()
+    )
+    if not catalog_item:
+        catalog_item = CatalogItem(
+            tenant_id=tenant_id,
+            canonical_name=canonical_name,
+            display_name=payload.canonical_name.strip(),
+            category_path=payload.line_category,
+            item_type=payload.line_type,
+            base_unit=payload.normalized_unit,
+        )
+        session.add(catalog_item)
+        session.flush()
+
+    line_item.catalog_item_id = catalog_item.id
+    if payload.line_type:
+        line_item.line_type = payload.line_type
+        catalog_item.item_type = payload.line_type
+    if payload.line_category:
+        line_item.line_category = payload.line_category
+        catalog_item.category_path = payload.line_category
+    if payload.normalized_unit:
+        line_item.normalized_unit = payload.normalized_unit
+        catalog_item.base_unit = payload.normalized_unit
+    line_item.normalization_confidence = Decimal("0.99")
+    line_item.needs_review = False
+    line_item.review_reason = None
+
+    alias_label = normalize_catalog_lookup_label(line_item.description or payload.canonical_name)
+    if alias_label:
+        alias = (
+            session.query(CatalogAlias)
+            .filter(CatalogAlias.tenant_id == tenant_id, CatalogAlias.normalized_label == alias_label)
+            .one_or_none()
+        )
+        if alias:
+            alias.catalog_item_id = catalog_item.id
+            alias.raw_label = line_item.description or payload.canonical_name
+            alias.confidence = Decimal("0.99")
+            alias.source = "manual"
+        else:
+            session.add(
+                CatalogAlias(
+                    tenant_id=tenant_id,
+                    raw_label=line_item.description or payload.canonical_name,
+                    normalized_label=alias_label,
+                    catalog_item_id=catalog_item.id,
+                    confidence=Decimal("0.99"),
+                    source="manual",
+                )
+            )
+
+    session.add(line_item)
+    session.commit()
+    session.refresh(line_item)
+    return line_item
+
+
+@app.get("/api/tenants/{tenant_id}/cost-trends", response_model=CostTrendResponse)
+def cost_trends(
+    tenant_id: str,
+    item_query: str,
+    days: int = 90,
+    vendor: str | None = None,
+    limit: int = 400,
+    session: Session = Depends(get_session),
+):
+    tenant_id = require_tenant(tenant_id)
+    item_query = item_query.strip()
+    if len(item_query) < 2:
+        raise HTTPException(status_code=400, detail="item_query deve ter pelo menos 2 caracteres")
+    days = max(7, min(days, 365))
+    limit = max(20, min(limit, 2000))
+
+    normalized_query = normalize_label(item_query)
+    now = datetime.utcnow()
+    current_start = now - timedelta(days=days)
+    previous_start = current_start - timedelta(days=days)
+
+    query = (
+        session.query(InvoiceLineItem, Invoice, CatalogItem)
+        .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
+        .outerjoin(CatalogItem, InvoiceLineItem.catalog_item_id == CatalogItem.id)
+        .filter(Invoice.tenant_id == tenant_id, Invoice.created_at >= previous_start)
+    )
+    if vendor:
+        query = query.filter(func.lower(Invoice.vendor) == vendor.strip().lower())
+
+    like_query = f"%{normalized_query}%"
+    query = query.filter(
+        (func.lower(func.coalesce(InvoiceLineItem.normalized_description, "")).like(like_query))
+        | (func.lower(func.coalesce(InvoiceLineItem.description, "")).like(like_query))
+        | (func.lower(func.coalesce(CatalogItem.canonical_name, "")).like(like_query))
+    )
+
+    rows = query.order_by(Invoice.created_at.desc()).limit(limit).all()
+
+    points: list[CostTrendPoint] = []
+    current_prices: list[Decimal] = []
+    previous_prices: list[Decimal] = []
+    for line_item, invoice, catalog_item in rows:
+        unit_price = line_item.normalized_unit_price
+        if unit_price is None:
+            unit_price = infer_normalized_unit_price(
+                quantity=line_item.quantity,
+                unit_price=line_item.unit_price,
+                line_subtotal=line_item.line_subtotal,
+                line_total=line_item.line_total,
+            )
+
+        points.append(
+            CostTrendPoint(
+                invoice_id=invoice.id,
+                invoice_number=invoice.invoice_number,
+                vendor=invoice.vendor,
+                created_at=invoice.created_at,
+                description=line_item.description,
+                canonical_item=catalog_item.canonical_name if catalog_item else line_item.normalized_description,
+                normalized_unit=line_item.normalized_unit,
+                normalized_quantity=line_item.normalized_quantity or line_item.quantity,
+                normalized_unit_price=unit_price,
+            )
+        )
+        if unit_price is None:
+            continue
+        if invoice.created_at >= current_start:
+            current_prices.append(unit_price)
+        else:
+            previous_prices.append(unit_price)
+
+    def avg(values: list[Decimal]) -> Decimal | None:
+        if not values:
+            return None
+        return (sum(values) / Decimal(len(values))).quantize(Decimal("0.0001"))
+
+    current_avg = avg(current_prices)
+    previous_avg = avg(previous_prices)
+    pct_change: Decimal | None = None
+    if current_avg is not None and previous_avg not in (None, Decimal("0")):
+        pct_change = (((current_avg - previous_avg) / previous_avg) * Decimal("100")).quantize(Decimal("0.01"))
+
+    return CostTrendResponse(
+        summary=CostTrendSummary(
+            current_avg_unit_price=current_avg,
+            previous_avg_unit_price=previous_avg,
+            pct_change=pct_change,
+            sample_size_current=len(current_prices),
+            sample_size_previous=len(previous_prices),
+            days=days,
+            vendor=vendor,
+            item_query=item_query,
+        ),
+        points=points,
+    )
+
+
 def serialize_invoice(invoice: Invoice) -> dict[str, Any]:
     learning_debug = getattr(invoice, "learning_debug", None)
     if isinstance(learning_debug, str):
@@ -702,6 +1961,11 @@ def serialize_invoice(invoice: Invoice) -> dict[str, Any]:
             "raw_text": invoice.raw_text,
             "ai_payload": invoice.ai_payload,
             "extraction_model": invoice.extraction_model,
+            "token_input": invoice.token_input,
+            "token_output": invoice.token_output,
+            "token_total": invoice.token_total,
+            "confidence_score": invoice.confidence_score,
+            "requires_review": invoice.requires_review,
             "notes": invoice.notes,
             "line_items": invoice.line_items,
             "learning_debug": learning_debug,
@@ -724,62 +1988,192 @@ def update_invoice(invoice_id: UUID, payload: InvoiceUpdateRequest, session: Ses
         setattr(invoice, field, value)
 
     if line_items_payload is not None:
+        default_tax_rate = infer_default_tax_rate(invoice.subtotal, invoice.tax)
         session.query(InvoiceLineItem).filter(InvoiceLineItem.invoice_id == invoice.id).delete()
         for index, item in enumerate(line_items_payload, start=1):
+            enriched = enrich_line_item_payload(
+                item,
+                tenant_id=invoice.tenant_id,
+                session=session,
+                default_tax_rate=default_tax_rate,
+                vendor_name=invoice.vendor,
+            )
             session.add(
                 InvoiceLineItem(
                     invoice_id=invoice.id,
                     position=index,
-                    code=item.get("code"),
-                    description=item.get("description"),
-                    quantity=item.get("quantity"),
-                    unit_price=item.get("unit_price"),
-                    line_subtotal=item.get("line_subtotal"),
-                    line_tax_amount=item.get("line_tax_amount"),
-                    line_total=item.get("line_total"),
-                    tax_rate=item.get("tax_rate"),
+                    code=enriched.get("code"),
+                    description=enriched.get("description"),
+                    normalized_description=enriched.get("normalized_description"),
+                    quantity=enriched.get("quantity"),
+                    unit_price=enriched.get("unit_price"),
+                    line_subtotal=enriched.get("line_subtotal"),
+                    line_tax_amount=enriched.get("line_tax_amount"),
+                    line_total=enriched.get("line_total"),
+                    tax_rate=enriched.get("tax_rate"),
+                    tax_rate_source=enriched.get("tax_rate_source"),
+                    catalog_item_id=enriched.get("catalog_item_id"),
+                    raw_unit=enriched.get("raw_unit"),
+                    normalized_unit=enriched.get("normalized_unit"),
+                        measurement_type=enriched.get("measurement_type"),
+                        normalized_quantity=enriched.get("normalized_quantity"),
+                        normalized_unit_price=enriched.get("normalized_unit_price"),
+                        line_category=enriched.get("line_category"),
+                        line_type=enriched.get("line_type"),
+                        normalization_confidence=enriched.get("normalization_confidence"),
+                        needs_review=bool(enriched.get("needs_review", False)),
+                        review_reason=enriched.get("review_reason"),
+                    )
                 )
-            )
 
     session.add(invoice)
     upsert_vendor_profile(invoice, session)
     upsert_invoice_template(invoice, session)
+    promote_manual_line_item_aliases(invoice, session)
     session.commit()
     session.refresh(invoice)
     invoice.line_items  # trigger lazy load for response
     return serialize_invoice(invoice)
 
 
-@app.post("/api/tenants/{tenant_id}/ingest", response_model=IngestResponse)
-def ingest_invoices(
+def _process_upload_for_ingest(
+    *,
     tenant_id: str,
-    files: List[UploadFile] = File(...),
-    session: Session = Depends(get_session),
-):
-    tenant_id = require_tenant(tenant_id)
-    if not files:
-        raise HTTPException(status_code=400, detail="Selecione pelo menos um ficheiro")
+    upload: UploadFile,
+    session: Session,
+    source: str = "upload",
+    persist_failure_record: bool = True,
+) -> tuple[Invoice | None, RejectedDocument | None]:
+    started_at = time.monotonic()
+    filename = upload.filename or "documento"
+    task_id = f"{tenant_id}:{filename}:{time.time_ns()}"
+    _watchtower_start(task_id, tenant_id=tenant_id, filename=filename)
+    logger.info("Starting ingest for %s (tenant=%s)", filename, tenant_id)
 
-    files_to_process: List[UploadFile] = []
-    for upload in files:
-        filename = (upload.filename or "").lower()
-        if filename.endswith(".zip"):
-            files_to_process.extend(expand_zip_upload(upload))
-        else:
-            files_to_process.append(upload)
+    upload_bytes_cache: bytes | None = None
 
-    if not files_to_process:
-        raise HTTPException(status_code=400, detail="Selecione pelo menos um ficheiro")
+    def _get_upload_bytes() -> bytes:
+        nonlocal upload_bytes_cache
+        if upload_bytes_cache is None:
+            upload_bytes_cache = _read_upload_bytes(upload)
+        return upload_bytes_cache
 
-    ingested_rows = []
-    for upload in files_to_process:
+    try:
+        _watchtower_stage(task_id, "precheck")
+        should_process, detected_type, validation_reason, cached_text, cached_raw, precheck_usage = precheck_invoice_candidate(upload)
+        logger.info(
+            "Precheck finished for %s in %.2fs (should_process=%s, detected_type=%s)",
+            filename,
+            time.monotonic() - started_at,
+            should_process,
+            detected_type,
+        )
+        if not should_process:
+            reason = validation_reason or "Documento inválido para processamento de faturas"
+            _watchtower_finish(task_id, status="rejected", reason=reason)
+            session.rollback()
+            if persist_failure_record:
+                persist_failed_import(
+                    session,
+                    tenant_id=tenant_id,
+                    filename=filename,
+                    reason=reason,
+                    detected_type=detected_type,
+                    source=source,
+                    mime_type=upload.content_type,
+                    file_bytes=_get_upload_bytes(),
+                )
+            session.commit()
+            return None, RejectedDocument(filename=filename, reason=reason, detected_type=detected_type)
+
         learning_debug = init_learning_debug()
-        extraction = extract_invoice_data(upload)
+        _watchtower_stage(task_id, "extraction")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                extract_invoice_data,
+                upload,
+                cached_text,
+                cached_raw,
+                precheck_usage,
+            )
+            extraction = future.result(timeout=90)
+        logger.info(
+            "Extraction finished for %s in %.2fs (is_invoice=%s, detected_type=%s)",
+            filename,
+            time.monotonic() - started_at,
+            extraction.get("is_invoice"),
+            extraction.get("detected_type"),
+        )
+
+        if not extraction.get("is_invoice"):
+            filename_hint = normalize_label(filename)
+            has_invoice_filename = any(token in filename_hint for token in ["fatura", "factura", "invoice"])
+            has_financial_signals = any(
+                extraction.get(field) is not None
+                for field in ["subtotal", "tax", "total", "invoice_number", "supplier_nif"]
+            )
+            if has_invoice_filename and has_financial_signals:
+                extraction["is_invoice"] = True
+                extraction["detected_type"] = "invoice_filename_hint"
+                extraction["validation_reason"] = "Accepted by filename + financial signal heuristic"
+
+        if not extraction.get("is_invoice"):
+            reason = extraction.get("validation_reason") or "Documento inválido para processamento de faturas"
+            detected = extraction.get("detected_type")
+            _watchtower_finish(task_id, status="rejected", reason=reason)
+            session.rollback()
+            if persist_failure_record:
+                persist_failed_import(
+                    session,
+                    tenant_id=tenant_id,
+                    filename=filename,
+                    reason=reason,
+                    detected_type=detected,
+                    source=source,
+                    mime_type=upload.content_type,
+                    file_bytes=_get_upload_bytes(),
+                )
+            session.commit()
+            return None, RejectedDocument(filename=filename, reason=reason, detected_type=detected)
+
+        _watchtower_stage(task_id, "template")
         extraction = apply_template_to_extraction(extraction, tenant_id, session, debug=learning_debug)
         extraction = apply_tenant_defaults_to_extraction(extraction, tenant_id, session)
+        extraction = apply_counterparty_nif_heuristics(extraction, tenant_id, session)
+        extraction = apply_vendor_profile_enrichment(extraction, tenant_id, session)
+
+        extracted_line_items = extraction.get("line_items")
+        missing_line_items = not _has_meaningful_line_items(extracted_line_items)
+
+        line_items_payload = _ensure_line_items(extraction, upload.filename)
+        extraction["line_items"] = line_items_payload
+        confidence_score, requires_review = score_extraction_confidence(extraction)
+        if missing_line_items:
+            requires_review = True
+            marker = "AUTO: linhas em falta/vazias — validar manualmente"
+            existing_notes = str(extraction.get("notes") or "").strip()
+            extraction["notes"] = f"{existing_notes} | {marker}" if existing_notes else marker
+
+        duplicate_candidate = find_potential_duplicate_invoice(
+            tenant_id=tenant_id,
+            supplier_nif=extraction.get("supplier_nif"),
+            invoice_number=extraction.get("invoice_number"),
+            total=_to_decimal_safe(extraction.get("total"), quant="0.01"),
+            session=session,
+        )
+        if duplicate_candidate is not None:
+            requires_review = True
+            duplicate_marker = f"DUPLICATE_CANDIDATE: provável duplicada de {duplicate_candidate.id}"
+            existing_notes = str(extraction.get("notes") or "").strip()
+            extraction["notes"] = f"{existing_notes} | {duplicate_marker}" if existing_notes else duplicate_marker
+
+        extraction["confidence_score"] = confidence_score
+        extraction["requires_review"] = requires_review
+
+        _watchtower_stage(task_id, "db_write")
         invoice = Invoice(
             tenant_id=tenant_id,
-            filename=upload.filename or "documento",
+            filename=filename,
             vendor=extraction["vendor"],
             vendor_address=extraction.get("vendor_address"),
             vendor_contact=extraction.get("vendor_contact"),
@@ -797,42 +2191,189 @@ def ingest_invoices(
             raw_text=extraction.get("raw_text"),
             ai_payload=extraction.get("ai_payload"),
             extraction_model=extraction.get("extraction_model"),
+            token_input=extraction.get("token_input"),
+            token_output=extraction.get("token_output"),
+            token_total=extraction.get("token_total"),
+            confidence_score=extraction.get("confidence_score"),
+            requires_review=bool(extraction.get("requires_review", False)),
             notes=extraction["notes"],
+            status="requere revisao" if extraction.get("requires_review") else "processed",
         )
         session.add(invoice)
         session.flush()
+        default_tax_rate = infer_default_tax_rate(invoice.subtotal, invoice.tax)
 
-        for item in extraction.get("line_items", []):
+        for index, item in enumerate(line_items_payload, start=1):
+            enriched = enrich_line_item_payload(
+                item,
+                tenant_id=tenant_id,
+                session=session,
+                default_tax_rate=default_tax_rate,
+                vendor_name=invoice.vendor,
+            )
             session.add(
                 InvoiceLineItem(
                     invoice_id=invoice.id,
-                    position=item.get("position") or len(invoice.line_items) + 1,
-                    code=item.get("code"),
-                    description=item.get("description"),
-                    quantity=item.get("quantity"),
-                    unit_price=item.get("unit_price"),
-                    line_subtotal=item.get("line_subtotal"),
-                    line_tax_amount=item.get("line_tax_amount"),
-                    line_total=item.get("line_total"),
-                    tax_rate=item.get("tax_rate"),
+                    position=enriched.get("position") or index,
+                    code=enriched.get("code"),
+                    description=enriched.get("description"),
+                    normalized_description=enriched.get("normalized_description"),
+                    quantity=enriched.get("quantity"),
+                    unit_price=enriched.get("unit_price"),
+                    line_subtotal=enriched.get("line_subtotal"),
+                    line_tax_amount=enriched.get("line_tax_amount"),
+                    line_total=enriched.get("line_total"),
+                    tax_rate=enriched.get("tax_rate"),
+                    tax_rate_source=enriched.get("tax_rate_source"),
+                    catalog_item_id=enriched.get("catalog_item_id"),
+                    raw_unit=enriched.get("raw_unit"),
+                    normalized_unit=enriched.get("normalized_unit"),
+                    measurement_type=enriched.get("measurement_type"),
+                    normalized_quantity=enriched.get("normalized_quantity"),
+                    normalized_unit_price=enriched.get("normalized_unit_price"),
+                    line_category=enriched.get("line_category"),
+                    line_type=enriched.get("line_type"),
+                    normalization_confidence=enriched.get("normalization_confidence"),
+                    needs_review=bool(enriched.get("needs_review", False)),
+                    review_reason=enriched.get("review_reason"),
                 )
             )
 
         if settings.debug_learning:
             invoice.learning_debug = json.dumps(learning_debug)
         session.flush()
+        upsert_vendor_profile(invoice, session)
+        upsert_invoice_template(invoice, session)
+        session.commit()
         session.refresh(invoice)
-        ingested_rows.append(invoice)
+        invoice.line_items
+        logger.info(
+            "DB write finished for %s in %.2fs (invoice_id=%s)",
+            filename,
+            time.monotonic() - started_at,
+            invoice.id,
+        )
+        _watchtower_finish(task_id, status="ingested")
+        return invoice, None
+    except InvalidDocumentError as exc:
+        logger.warning("Documento inválido %s: %s", filename, exc)
+        session.rollback()
+        _watchtower_finish(task_id, status="rejected", reason=str(exc))
+        if persist_failure_record:
+            persist_failed_import(
+                session,
+                tenant_id=tenant_id,
+                filename=filename,
+                reason=str(exc),
+                detected_type="invalid_document",
+                source=source,
+                mime_type=upload.content_type,
+                file_bytes=_get_upload_bytes(),
+            )
+        session.commit()
+        return None, RejectedDocument(filename=filename, reason=str(exc), detected_type="invalid_document")
+    except FutureTimeout:
+        logger.warning("Timeout ao processar documento %s", filename)
+        session.rollback()
+        _watchtower_finish(task_id, status="rejected", reason="processing_timeout")
+        reason = "Tempo limite excedido durante extração (90s por ficheiro)"
+        if persist_failure_record:
+            persist_failed_import(
+                session,
+                tenant_id=tenant_id,
+                filename=filename,
+                reason=reason,
+                detected_type="processing_timeout",
+                source=source,
+                mime_type=upload.content_type,
+                file_bytes=_get_upload_bytes(),
+            )
+        session.commit()
+        return None, RejectedDocument(filename=filename, reason=reason, detected_type="processing_timeout")
+    except Exception as exc:
+        logger.exception("Falha ao processar documento %s: %s", filename, exc)
+        session.rollback()
+        _watchtower_finish(task_id, status="rejected", reason="processing_error")
+        reason = "Falha técnica ao analisar o documento"
+        if persist_failure_record:
+            persist_failed_import(
+                session,
+                tenant_id=tenant_id,
+                filename=filename,
+                reason=reason,
+                detected_type="processing_error",
+                source=source,
+                mime_type=upload.content_type,
+                file_bytes=_get_upload_bytes(),
+            )
+        session.commit()
+        return None, RejectedDocument(filename=filename, reason=reason, detected_type="processing_error")
 
-    session.commit()
+
+@app.post("/api/tenants/{tenant_id}/ingest", response_model=IngestResponse)
+def ingest_invoices(
+    tenant_id: str,
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    session: Session = Depends(get_session),
+):
+    tenant_id = require_tenant(tenant_id)
+    if not files:
+        raise HTTPException(status_code=400, detail="Selecione pelo menos um ficheiro")
+
+    files_to_process: List[tuple[UploadFile, str]] = []
+    rejected_rows: list[RejectedDocument] = []
+    for upload in files:
+        filename = (upload.filename or "").lower()
+        if filename.endswith(".zip"):
+            try:
+                expanded = expand_zip_upload(upload)
+                files_to_process.extend((item, "zip_entry") for item in expanded)
+            except HTTPException as exc:
+                detail = str(exc.detail)
+                upload_bytes = _read_upload_bytes(upload)
+                session.rollback()
+                persist_failed_import(
+                    session,
+                    tenant_id=tenant_id,
+                    filename=upload.filename or "documento.zip",
+                    reason=f"Falha ao expandir ZIP: {detail}",
+                    detected_type="zip_error",
+                    source="zip_archive",
+                    mime_type=upload.content_type,
+                    file_bytes=upload_bytes,
+                )
+                session.commit()
+                rejected_rows.append(
+                    RejectedDocument(
+                        filename=upload.filename or "documento.zip",
+                        reason=f"Falha ao expandir ZIP: {detail}",
+                        detected_type="zip_error",
+                    )
+                )
+        else:
+            files_to_process.append((upload, "upload"))
+
+    if not files_to_process and not rejected_rows:
+        raise HTTPException(status_code=400, detail="Selecione pelo menos um ficheiro")
+
+    ingested_rows: list[Invoice] = []
+    for upload, source in files_to_process:
+        invoice, rejection = _process_upload_for_ingest(tenant_id=tenant_id, upload=upload, session=session, source=source)
+        if invoice:
+            ingested_rows.append(invoice)
+        if rejection:
+            rejected_rows.append(rejection)
+
+    logger.info("Committed ingest batch for tenant=%s (ingested=%s, rejected=%s)", tenant_id, len(ingested_rows), len(rejected_rows))
 
     for invoice in ingested_rows:
-        try:
-            upsert_invoice_embedding(invoice)
-        except Exception as exc:
-            logger.warning("Falha ao guardar embedding da fatura %s: %s", invoice.id, exc)
+        background_tasks.add_task(enqueue_invoice_embedding_job, invoice.id)
 
-    return {"ingested": [serialize_invoice(invoice) for invoice in ingested_rows]}
+    return {
+        "ingested": [serialize_invoice(invoice) for invoice in ingested_rows],
+        "rejected": [item.model_dump() for item in rejected_rows],
+    }
 
 
 @app.post("/api/tenants/{tenant_id}/chat", response_model=ChatResponse)
@@ -897,10 +2438,67 @@ def delete_invoice(invoice_id: UUID, session: Session = Depends(get_session)):
     return {"ok": True}
 
 
+@app.delete("/api/failed-imports/{failed_import_id}")
+def delete_failed_import(failed_import_id: UUID, session: Session = Depends(get_session)):
+    row = session.get(FailedImport, failed_import_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Falha de importação não encontrada")
+    session.delete(row)
+    session.commit()
+    return {"ok": True}
+
+
+@app.post("/api/failed-imports/{failed_import_id}/retry")
+def retry_failed_import(
+    failed_import_id: UUID,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
+    row = session.get(FailedImport, failed_import_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Falha de importação não encontrada")
+    if not row.file_blob:
+        raise HTTPException(status_code=400, detail="Este ficheiro não foi guardado para retry automático")
+
+    filename = row.filename or "documento"
+    upload = UploadFile(filename=filename, file=io.BytesIO(row.file_blob))
+
+    row.retry_count = (row.retry_count or 0) + 1
+    row.last_retry_at = datetime.utcnow()
+    session.add(row)
+    session.commit()
+
+    invoice, rejection = _process_upload_for_ingest(
+        tenant_id=row.tenant_id,
+        upload=upload,
+        session=session,
+        source="retry",
+        persist_failure_record=False,
+    )
+
+    if invoice:
+        current = session.get(FailedImport, failed_import_id)
+        if current:
+            session.delete(current)
+            session.commit()
+        background_tasks.add_task(enqueue_invoice_embedding_job, invoice.id)
+        return {"ok": True, "ingested": serialize_invoice(invoice), "rejected": None}
+
+    if rejection:
+        current = session.get(FailedImport, failed_import_id)
+        if current:
+            current.reason = rejection.reason
+            current.detected_type = rejection.detected_type
+            session.add(current)
+            session.commit()
+    return {"ok": False, "ingested": None, "rejected": rejection.model_dump() if rejection else None}
+
+
 @app.post("/api/invoices/{invoice_id}/corrections", response_model=InvoiceBase)
 def apply_invoice_correction(
     invoice_id: UUID,
     payload: InvoiceCorrectionRequest,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ):
     invoice = session.get(Invoice, invoice_id)
@@ -916,8 +2514,14 @@ def apply_invoice_correction(
         previous_payload=invoice.ai_payload,
     )
     extraction = apply_tenant_defaults_to_extraction(extraction, invoice.tenant_id, session)
+    extraction = apply_counterparty_nif_heuristics(extraction, invoice.tenant_id, session)
+    extraction = apply_vendor_profile_enrichment(extraction, invoice.tenant_id, session)
+    extraction["line_items"] = _ensure_line_items(extraction, invoice.filename)
+    confidence_score, requires_review = score_extraction_confidence(extraction)
+    extraction["confidence_score"] = confidence_score
+    extraction["requires_review"] = requires_review
     apply_extraction_to_invoice(invoice, extraction, session)
-    invoice.status = "corrigido"
+    invoice.status = "requere revisao" if requires_review else "corrigido"
     upsert_vendor_profile(invoice, session)
     upsert_invoice_template(invoice, session)
 
@@ -937,10 +2541,7 @@ def apply_invoice_correction(
     )
     session.add(correction)
     session.commit()
-    try:
-        upsert_invoice_embedding(invoice)
-    except Exception as exc:
-        logger.warning("Falha ao atualizar embedding da fatura %s: %s", invoice.id, exc)
+    background_tasks.add_task(enqueue_invoice_embedding_job, invoice.id)
     session.refresh(invoice)
     return serialize_invoice(invoice)
 
