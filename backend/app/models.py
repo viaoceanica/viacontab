@@ -14,6 +14,7 @@ class Invoice(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(String(64), nullable=False, index=True)
     filename = Column(String(255), nullable=False)
+    storage_object_key = Column(String(1024), nullable=True)
     vendor = Column(String(255), nullable=True)
     vendor_address = Column(Text, nullable=True)
     vendor_contact = Column(String(255), nullable=True)
@@ -201,3 +202,21 @@ class FailedImport(Base):
     retry_count = Column(Integer, nullable=False, default=0)
     last_retry_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class StorageUploadQueue(Base):
+    __tablename__ = "storage_upload_queue"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(String(64), nullable=False, index=True)
+    filename = Column(String(255), nullable=False)
+    content_type = Column(String(128), nullable=True)
+    file_size = Column(Integer, nullable=False)
+    file_blob = Column(LargeBinary, nullable=False)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    object_key = Column(String(1024), nullable=True)
+    next_retry_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

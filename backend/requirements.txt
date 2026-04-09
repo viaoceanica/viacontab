@@ -12,3 +12,8 @@ pypdf
 pymupdf
 opencv-python-headless
 pillow
+requests
+pyzbar
+pylibdmtx
+zxing-cpp
+boto3

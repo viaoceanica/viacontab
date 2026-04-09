@@ -1,0 +1,301 @@
+{
+  "info": {
+    "name": "ViaContab API",
+    "description": "Postman collection for ViaContab backend API.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "version": {
+      "major": 0,
+      "minor": 1,
+      "patch": 0
+    }
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8100" },
+    { "key": "tenantId", "value": "demo" },
+    { "key": "invoiceId", "value": "" },
+    { "key": "lineItemId", "value": "" },
+    { "key": "failedImportId", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /api/health",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/health"
+          }
+        },
+        {
+          "name": "GET /api/ready",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/ready"
+          }
+        },
+        {
+          "name": "GET /api/watchtower/uploads",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/watchtower/uploads"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Tenant",
+      "item": [
+        {
+          "name": "GET tenant profile",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/profile"
+          }
+        },
+        {
+          "name": "PUT tenant profile",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"company_name\": \"Via Oceânica\",\n  \"company_nif\": \"123456789\"\n}"
+            },
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/profile"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ingest & Invoices",
+      "item": [
+        {
+          "name": "POST ingest (multipart)",
+          "request": {
+            "method": "POST",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "files",
+                  "type": "file",
+                  "src": ""
+                }
+              ]
+            },
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/ingest"
+          }
+        },
+        {
+          "name": "GET tenant invoices",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/invoices"
+          }
+        },
+        {
+          "name": "PATCH invoice (edit + line items)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vendor\": \"Fornecedor X\",\n  \"category\": \"servicos\",\n  \"invoice_number\": \"FT 2026/123\",\n  \"invoice_date\": \"2026-04-06\",\n  \"due_date\": \"2026-04-20\",\n  \"subtotal\": 100.0,\n  \"tax\": 23.0,\n  \"total\": 123.0,\n  \"notes\": \"manual correction\",\n  \"status\": \"corrigido\",\n  \"requires_review\": false,\n  \"line_items\": [\n    {\n      \"id\": \"{{lineItemId}}\",\n      \"code\": \"A1\",\n      \"description\": \"Serviço mensal\",\n      \"quantity\": 1,\n      \"unit_price\": 100,\n      \"line_subtotal\": 100,\n      \"line_tax_amount\": 23,\n      \"line_total\": 123,\n      \"tax_rate\": 23\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/api/invoices/{{invoiceId}}"
+          }
+        },
+        {
+          "name": "DELETE invoice",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/api/invoices/{{invoiceId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Failed Imports",
+      "item": [
+        {
+          "name": "GET failed imports",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/failed-imports"
+          }
+        },
+        {
+          "name": "POST retry failed import",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/failed-imports/{{failedImportId}}/retry"
+          }
+        },
+        {
+          "name": "DELETE failed import",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/api/failed-imports/{{failedImportId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Review & Automation",
+      "item": [
+        {
+          "name": "GET line-items/review",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/line-items/review"
+          }
+        },
+        {
+          "name": "GET line-items/quality",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/line-items/quality"
+          }
+        },
+        {
+          "name": "GET automation-blockers",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/automation-blockers"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Line Item Labeling",
+      "item": [
+        {
+          "name": "GET suggestions",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/tenants/{{tenantId}}/line-items/suggestions?query=hosting&limit=8",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "tenants", "{{tenantId}}", "line-items", "suggestions"],
+              "query": [
+                { "key": "query", "value": "hosting" },
+                { "key": "limit", "value": "8" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "POST label line item",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"canonical_name\": \"hosting mensal\",\n  \"line_type\": \"service\",\n  \"line_category\": \"services/subscription\",\n  \"normalized_unit\": \"unit\"\n}"
+            },
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/line-items/{{lineItemId}}/label"
+          }
+        },
+        {
+          "name": "POST label-bulk line item",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"canonical_name\": \"hosting mensal\",\n  \"line_type\": \"service\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/tenants/{{tenantId}}/line-items/{{lineItemId}}/label-bulk?scope=tenant",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "tenants", "{{tenantId}}", "line-items", "{{lineItemId}}", "label-bulk"],
+              "query": [{ "key": "scope", "value": "tenant" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Corrections & Chat",
+      "item": [
+        {
+          "name": "POST invoice correction",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"O fornecedor correto é Via Oceânica\"\n}"
+            },
+            "url": "{{baseUrl}}/api/invoices/{{invoiceId}}/corrections"
+          }
+        },
+        {
+          "name": "GET invoice corrections",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/invoices/{{invoiceId}}/corrections"
+          }
+        },
+        {
+          "name": "POST tenant chat",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"question\": \"Quanto gastei com hosting este mês?\",\n  \"top_k\": 5\n}"
+            },
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/chat"
+          }
+        },
+        {
+          "name": "GET cost trends",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/tenants/{{tenantId}}/cost-trends?item_query=hosting&days=90&limit=400",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "tenants", "{{tenantId}}", "cost-trends"],
+              "query": [
+                { "key": "item_query", "value": "hosting" },
+                { "key": "days", "value": "90" },
+                { "key": "limit", "value": "400" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Upload Telemetry",
+      "item": [
+        {
+          "name": "POST telemetry upload-event",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"step\": \"validate\",\n  \"status\": \"enter\",\n  \"session_id\": \"session-123\",\n  \"context\": \"upload_started\",\n  \"timestamp\": \"2026-04-06T22:30:00Z\"\n}"
+            },
+            "url": "{{baseUrl}}/api/tenants/{{tenantId}}/telemetry/upload-event"
+          }
+        },
+        {
+          "name": "GET telemetry upload-funnel",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/tenants/{{tenantId}}/telemetry/upload-funnel?hours=72",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "tenants", "{{tenantId}}", "telemetry", "upload-funnel"],
+              "query": [{ "key": "hours", "value": "72" }]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

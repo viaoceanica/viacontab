@@ -10,4 +10,11 @@ node_modules/
 .next/
 __pycache__/
 *.pyc
+.deps/
+.venv/
+.pytest_cache/
+.coverage
+coverage/
+dist/
 .DS_Store
+*.tsbuildinfo

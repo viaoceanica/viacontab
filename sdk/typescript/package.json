@@ -1,0 +1,17 @@
+{
+  "name": "@viacontab/api-client",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for ViaContab API",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "typescript": "^5.4.3"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@viacontab/openapi-client",
+  "version": "0.1.0",
+  "description": "OpenAPI-generated TypeScript client for ViaContab API",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "openapi.json"],
+  "scripts": {
+    "generate": "openapi --input openapi.json --output src/generated --client fetch --useUnionTypes --exportCore true --exportServices true --exportModels true",
+    "build": "npm run generate && tsc -p tsconfig.json",
+    "clean": "rm -rf dist src/generated"
+  },
+  "devDependencies": {
+    "openapi-typescript-codegen": "^0.29.0",
+    "typescript": "^5.4.3"
+  }
+}

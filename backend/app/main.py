@@ -8,26 +8,31 @@ import unicodedata
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, List
-from uuid import UUID
+from urllib.parse import quote, urlparse
+from uuid import UUID, uuid4
 
+import boto3
 import io
 import json
 import os
 import zipfile
+from botocore.config import Config as BotocoreConfig
+from botocore.exceptions import ClientError
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from openai import OpenAI
+from starlette.datastructures import Headers
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, or_, text
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .config import get_settings
 from .database import engine, get_session, SessionLocal
 from .embeddings import search_invoice_embeddings, upsert_invoice_embedding
-from .models import Base, CatalogAlias, CatalogItem, FailedImport, Invoice, InvoiceCorrection, InvoiceLineItem, InvoiceTemplate, VendorProfile, TenantProfile
+from .models import Base, CatalogAlias, CatalogItem, FailedImport, Invoice, InvoiceCorrection, InvoiceLineItem, InvoiceTemplate, StorageUploadQueue, VendorProfile, TenantProfile
 from .processing import (
     _lookup_vendor_name_from_nif,
     _lookup_vendor_profile_from_nif,
@@ -63,6 +68,12 @@ from .schemas import (
     RejectedDocument,
     TenantProfileRequest,
     TenantProfileResponse,
+    StorageUploadCompleteRequest,
+    StorageUploadInitRequest,
+    StorageUploadInitResponse,
+    UploadTelemetryEventRequest,
+    UploadTelemetryFunnelResponse,
+    UploadTelemetryStepSummary,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +82,11 @@ settings = get_settings()
 WATCHTOWER_LOCK = threading.Lock()
 WATCHTOWER_ACTIVE: dict[str, dict[str, Any]] = {}
 WATCHTOWER_RECENT: deque[dict[str, Any]] = deque(maxlen=500)
+
+UPLOAD_TELEMETRY_LOCK = threading.Lock()
+UPLOAD_TELEMETRY_EVENTS: deque[dict[str, Any]] = deque(maxlen=10000)
+
+STORAGE_QUEUE_STOP = threading.Event()
 
 
 def _watchtower_start(task_id: str, tenant_id: str, filename: str) -> None:
@@ -122,7 +138,68 @@ def _watchtower_snapshot() -> dict[str, Any]:
         recent = list(WATCHTOWER_RECENT)
     return {"active": active, "recent": recent}
 
+
+def _record_upload_telemetry_event(tenant_id: str, payload: UploadTelemetryEventRequest) -> None:
+    if payload.timestamp is None:
+        event_timestamp = datetime.now(timezone.utc)
+    elif payload.timestamp.tzinfo is None:
+        event_timestamp = payload.timestamp.replace(tzinfo=timezone.utc)
+    else:
+        event_timestamp = payload.timestamp.astimezone(timezone.utc)
+
+    event = {
+        "tenant_id": tenant_id,
+        "step": payload.step,
+        "status": payload.status,
+        "session_id": payload.session_id,
+        "context": payload.context,
+        "timestamp": event_timestamp,
+    }
+    with UPLOAD_TELEMETRY_LOCK:
+        UPLOAD_TELEMETRY_EVENTS.appendleft(event)
+
+
+def _summarize_upload_funnel(tenant_id: str, hours: int = 24) -> UploadTelemetryFunnelResponse:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, min(hours, 168)))
+    counters: dict[str, dict[str, int]] = {
+        "validate": {"enter": 0, "success": 0, "failure": 0},
+        "extract": {"enter": 0, "success": 0, "failure": 0},
+        "review": {"enter": 0, "success": 0, "failure": 0},
+        "save": {"enter": 0, "success": 0, "failure": 0},
+    }
+    total_events = 0
+
+    with UPLOAD_TELEMETRY_LOCK:
+        events = list(UPLOAD_TELEMETRY_EVENTS)
+
+    for event in events:
+        if event.get("tenant_id") != tenant_id:
+            continue
+        timestamp = event.get("timestamp")
+        if not isinstance(timestamp, datetime) or timestamp < cutoff:
+            continue
+
+        step = str(event.get("step") or "").strip()
+        status = str(event.get("status") or "").strip()
+        if step not in counters or status not in counters[step]:
+            continue
+        counters[step][status] += 1
+        total_events += 1
+
+    steps = [
+        UploadTelemetryStepSummary(step=step, **counts)
+        for step, counts in counters.items()
+    ]
+    return UploadTelemetryFunnelResponse(
+        tenant_id=tenant_id,
+        total_events=total_events,
+        steps=steps,
+        generated_at=datetime.now(timezone.utc),
+    )
+
+
 MISSING_INVOICE_COLUMNS = {
+    "storage_object_key": "ALTER TABLE invoices ADD COLUMN storage_object_key VARCHAR(1024)",
     "supplier_nif": "ALTER TABLE invoices ADD COLUMN supplier_nif VARCHAR(128)",
     "customer_name": "ALTER TABLE invoices ADD COLUMN customer_name VARCHAR(255)",
     "customer_nif": "ALTER TABLE invoices ADD COLUMN customer_nif VARCHAR(128)",
@@ -1409,6 +1486,224 @@ MAX_ZIP_MEMBERS = 200
 MAX_ZIP_MEMBER_SIZE = 20 * 1024 * 1024  # 20 MB per file
 MAX_ZIP_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024  # 100 MB total
 MAX_FAILED_IMPORT_BLOB = 20 * 1024 * 1024  # 20 MB stored for retry
+MAX_R2_OBJECT_SIZE = 50 * 1024 * 1024  # 50 MB guardrail for direct storage ingest
+
+
+def _r2_endpoint() -> str:
+    if settings.r2_endpoint:
+        raw_endpoint = settings.r2_endpoint.strip().rstrip("/")
+        parsed = urlparse(raw_endpoint)
+        if parsed.scheme and parsed.netloc:
+            if parsed.path and parsed.path != "/":
+                logger.warning("R2_ENDPOINT inclui path (%s); a usar apenas scheme+host", parsed.path)
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return raw_endpoint
+    if settings.r2_account_id:
+        return f"https://{settings.r2_account_id}.r2.cloudflarestorage.com"
+    return ""
+
+
+def _ensure_r2_enabled() -> None:
+    missing = []
+    if not settings.r2_bucket:
+        missing.append("R2_BUCKET")
+    if not _r2_endpoint():
+        missing.append("R2_ENDPOINT or R2_ACCOUNT_ID")
+    if not settings.r2_access_key_id:
+        missing.append("R2_ACCESS_KEY_ID")
+    if not settings.r2_secret_access_key:
+        missing.append("R2_SECRET_ACCESS_KEY")
+    if missing:
+        joined = ", ".join(missing)
+        raise HTTPException(status_code=503, detail=f"R2 não configurado ({joined})")
+
+
+def _r2_client():
+    _ensure_r2_enabled()
+    return boto3.client(
+        "s3",
+        endpoint_url=_r2_endpoint(),
+        aws_access_key_id=settings.r2_access_key_id,
+        aws_secret_access_key=settings.r2_secret_access_key,
+        region_name="auto",
+        config=BotocoreConfig(signature_version="s3v4"),
+    )
+
+
+def _sanitize_storage_filename(filename: str) -> str:
+    base = os.path.basename(filename or "").strip() or "documento"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+    return safe[:120] or "documento"
+
+
+def _tenant_object_prefix(tenant_id: str) -> str:
+    return f"tenants/{quote(tenant_id, safe='')}/"
+
+
+def _build_tenant_object_key(tenant_id: str, filename: str) -> str:
+    now = datetime.utcnow().strftime("%Y/%m/%d")
+    safe_name = _sanitize_storage_filename(filename)
+    return f"{_tenant_object_prefix(tenant_id)}incoming/{now}/{uuid4().hex}_{safe_name}"
+
+
+def _assert_tenant_object_key(tenant_id: str, object_key: str) -> str:
+    normalized = object_key.strip().lstrip("/")
+    if not normalized.startswith(_tenant_object_prefix(tenant_id)):
+        raise HTTPException(status_code=403, detail="object_key fora do prefixo do tenant")
+    return normalized
+
+
+def _r2_is_configured() -> bool:
+    return bool(settings.r2_bucket and _r2_endpoint() and settings.r2_access_key_id and settings.r2_secret_access_key)
+
+
+def _upload_bytes_to_r2(
+    *,
+    tenant_id: str,
+    filename: str,
+    content_type: str | None,
+    file_bytes: bytes,
+) -> str:
+    client = _r2_client()
+    object_key = _build_tenant_object_key(tenant_id, filename)
+    params: dict[str, Any] = {
+        "Bucket": settings.r2_bucket,
+        "Key": object_key,
+        "Body": file_bytes,
+    }
+    if content_type:
+        params["ContentType"] = content_type
+    client.put_object(**params)
+    return object_key
+
+
+def _enqueue_storage_upload(
+    *,
+    tenant_id: str,
+    filename: str,
+    content_type: str | None,
+    file_bytes: bytes,
+    session: Session,
+    error_reason: str | None = None,
+) -> StorageUploadQueue | None:
+    if not file_bytes or len(file_bytes) > MAX_R2_OBJECT_SIZE:
+        return None
+    row = StorageUploadQueue(
+        tenant_id=tenant_id,
+        filename=_sanitize_storage_filename(filename),
+        content_type=(content_type or "").strip() or None,
+        file_size=len(file_bytes),
+        file_blob=file_bytes,
+        status="pending",
+        attempts=0,
+        last_error=(error_reason or "").strip()[:1000] or None,
+        next_retry_at=datetime.utcnow(),
+    )
+    session.add(row)
+    session.commit()
+    return row
+
+
+def _flush_storage_upload_queue(session: Session, *, limit: int = 10) -> dict[str, int]:
+    if not _r2_is_configured():
+        return {"attempted": 0, "uploaded": 0, "failed": 0}
+
+    now = datetime.utcnow()
+    rows = (
+        session.query(StorageUploadQueue)
+        .filter(
+            StorageUploadQueue.status == "pending",
+            or_(StorageUploadQueue.next_retry_at.is_(None), StorageUploadQueue.next_retry_at <= now),
+        )
+        .order_by(StorageUploadQueue.created_at.asc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+
+    attempted = 0
+    uploaded = 0
+    failed = 0
+    for row in rows:
+        attempted += 1
+        try:
+            object_key = _upload_bytes_to_r2(
+                tenant_id=row.tenant_id,
+                filename=row.filename,
+                content_type=row.content_type,
+                file_bytes=row.file_blob,
+            )
+            row.status = "uploaded"
+            row.object_key = object_key
+            row.file_blob = b""
+            row.last_error = None
+            row.next_retry_at = None
+            uploaded += 1
+        except Exception as exc:
+            row.attempts = int(row.attempts or 0) + 1
+            wait_minutes = min(60, 2 ** min(row.attempts, 6))
+            row.next_retry_at = datetime.utcnow() + timedelta(minutes=wait_minutes)
+            row.last_error = str(exc)[:1000]
+            row.status = "pending" if row.attempts < 12 else "failed"
+            if row.status == "failed":
+                failed += 1
+
+    if attempted:
+        session.commit()
+    return {"attempted": attempted, "uploaded": uploaded, "failed": failed}
+
+
+def _mirror_to_storage_or_queue(
+    *,
+    tenant_id: str,
+    filename: str,
+    content_type: str | None,
+    file_bytes: bytes,
+    session: Session,
+) -> tuple[str, str | None]:
+    if not file_bytes:
+        return "skip", None
+
+    if not _r2_is_configured():
+        _enqueue_storage_upload(
+            tenant_id=tenant_id,
+            filename=filename,
+            content_type=content_type,
+            file_bytes=file_bytes,
+            session=session,
+            error_reason="R2 não configurado no momento da ingestão",
+        )
+        return "queued", None
+
+    try:
+        object_key = _upload_bytes_to_r2(
+            tenant_id=tenant_id,
+            filename=filename,
+            content_type=content_type,
+            file_bytes=file_bytes,
+        )
+        return "uploaded", object_key
+    except Exception as exc:
+        _enqueue_storage_upload(
+            tenant_id=tenant_id,
+            filename=filename,
+            content_type=content_type,
+            file_bytes=file_bytes,
+            session=session,
+            error_reason=f"Falha no upload imediato para R2: {exc}",
+        )
+        return "queued", None
+
+
+def _storage_queue_worker_loop(interval_seconds: int = 60) -> None:
+    while not STORAGE_QUEUE_STOP.is_set():
+        session = SessionLocal()
+        try:
+            _flush_storage_upload_queue(session, limit=50)
+        except Exception as exc:
+            logger.warning("Falha ao processar storage_upload_queue em background: %s", exc)
+        finally:
+            session.close()
+        STORAGE_QUEUE_STOP.wait(interval_seconds)
 
 
 def expand_zip_upload(upload: UploadFile) -> list[UploadFile]:
@@ -1478,7 +1773,14 @@ def build_chat_answer(question: str, contexts: list[str]) -> str:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
-    yield
+    STORAGE_QUEUE_STOP.clear()
+    worker = threading.Thread(target=_storage_queue_worker_loop, name="storage-queue-worker", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        STORAGE_QUEUE_STOP.set()
+        worker.join(timeout=5)
 
 
 app = FastAPI(title="ViaContab API", version="0.1.0", lifespan=lifespan)
@@ -1490,10 +1792,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def require_tenant(tenant_id: str) -> str:
+def require_tenant(tenant_id: str | None) -> str:
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id é obrigatório")
-    return tenant_id
+    normalized = tenant_id.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="tenant_id é obrigatório")
+    return normalized
+
+
+def resolve_tenant_scope(path_tenant_id: str | None = None, header_tenant_id: str | None = None) -> str:
+    path_value = require_tenant(path_tenant_id) if path_tenant_id else None
+    header_value = require_tenant(header_tenant_id) if header_tenant_id else None
+
+    if path_value and header_value and path_value != header_value:
+        raise HTTPException(status_code=403, detail="tenant_id em conflito entre path e header")
+
+    resolved = path_value or header_value
+    if not resolved:
+        raise HTTPException(status_code=400, detail="tenant_id é obrigatório")
+    return resolved
+
+
+def require_invoice_for_tenant(session: Session, invoice_id: UUID, tenant_id: str) -> Invoice:
+    invoice = (
+        session.query(Invoice)
+        .filter(Invoice.id == invoice_id, Invoice.tenant_id == tenant_id)
+        .one_or_none()
+    )
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Fatura não encontrada")
+    return invoice
+
+
+def require_failed_import_for_tenant(session: Session, failed_import_id: UUID, tenant_id: str) -> FailedImport:
+    row = (
+        session.query(FailedImport)
+        .filter(FailedImport.id == failed_import_id, FailedImport.tenant_id == tenant_id)
+        .one_or_none()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Falha de importação não encontrada")
+    return row
 
 
 def _read_upload_bytes(upload: UploadFile) -> bytes:
@@ -1667,6 +2007,19 @@ def ready(session: Session = Depends(get_session)):
     return {"ok": True, "service": "viacontab-backend", "ready": True}
 
 
+@app.post("/api/tenants/{tenant_id}/telemetry/upload-event")
+def record_upload_telemetry_event(tenant_id: str, payload: UploadTelemetryEventRequest):
+    tenant_id = require_tenant(tenant_id)
+    _record_upload_telemetry_event(tenant_id, payload)
+    return {"ok": True}
+
+
+@app.get("/api/tenants/{tenant_id}/telemetry/upload-funnel", response_model=UploadTelemetryFunnelResponse)
+def upload_telemetry_funnel(tenant_id: str, hours: int = 24):
+    tenant_id = require_tenant(tenant_id)
+    return _summarize_upload_funnel(tenant_id, hours=hours)
+
+
 @app.get("/api/tenants/{tenant_id}/profile", response_model=TenantProfileResponse)
 def get_tenant_profile(tenant_id: str, session: Session = Depends(get_session)):
     tenant_id = require_tenant(tenant_id)
@@ -1692,6 +2045,7 @@ def update_tenant_profile(tenant_id: str, payload: TenantProfileRequest, session
 @app.get("/api/tenants/{tenant_id}/invoices", response_model=InvoiceListResponse)
 def list_invoices(tenant_id: str, session: Session = Depends(get_session)):
     tenant_id = require_tenant(tenant_id)
+    _flush_storage_upload_queue(session, limit=10)
     invoices = (
         session.query(Invoice)
         .options(selectinload(Invoice.line_items))
@@ -1700,6 +2054,26 @@ def list_invoices(tenant_id: str, session: Session = Depends(get_session)):
         .all()
     )
     return {"items": [serialize_invoice(invoice) for invoice in invoices]}
+
+
+@app.get("/api/tenants/{tenant_id}/invoices/{invoice_id}/pdf-url")
+def invoice_pdf_url(tenant_id: str, invoice_id: UUID, session: Session = Depends(get_session)):
+    tenant_id = require_tenant(tenant_id)
+    invoice = require_invoice_for_tenant(session, invoice_id, tenant_id)
+    object_key = str(getattr(invoice, "storage_object_key", "") or "").strip()
+    if not object_key:
+        raise HTTPException(status_code=404, detail="PDF não disponível no storage")
+
+    safe_key = _assert_tenant_object_key(tenant_id, object_key)
+    client = _r2_client()
+    expires_in = max(60, min(int(settings.r2_presign_expiry_seconds or 300), 3600))
+    url = client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.r2_bucket, "Key": safe_key},
+        ExpiresIn=expires_in,
+        HttpMethod="GET",
+    )
+    return {"url": url, "expires_in_seconds": expires_in, "object_key": safe_key}
 
 
 @app.get("/api/tenants/{tenant_id}/failed-imports", response_model=FailedImportListResponse)
@@ -1713,6 +2087,47 @@ def list_failed_imports(tenant_id: str, session: Session = Depends(get_session))
     )
     return {
         "items": [FailedImportBase.model_validate(row).model_dump(mode="json") for row in rows]
+    }
+
+
+@app.get("/api/tenants/{tenant_id}/storage/upload-queue")
+def storage_upload_queue_status(tenant_id: str, limit: int = 100, session: Session = Depends(get_session)):
+    tenant_id = require_tenant(tenant_id)
+    _flush_storage_upload_queue(session, limit=20)
+
+    limit = max(1, min(limit, 500))
+    rows = (
+        session.query(StorageUploadQueue)
+        .filter(StorageUploadQueue.tenant_id == tenant_id)
+        .order_by(StorageUploadQueue.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "summary": {
+            "pending": sum(1 for row in rows if row.status == "pending"),
+            "uploaded": sum(1 for row in rows if row.status == "uploaded"),
+            "failed": sum(1 for row in rows if row.status == "failed"),
+            "total": len(rows),
+        },
+        "items": [
+            {
+                "id": str(row.id),
+                "tenant_id": row.tenant_id,
+                "filename": row.filename,
+                "content_type": row.content_type,
+                "file_size": row.file_size,
+                "status": row.status,
+                "attempts": row.attempts,
+                "object_key": row.object_key,
+                "last_error": row.last_error,
+                "next_retry_at": row.next_retry_at.isoformat() if row.next_retry_at else None,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in rows
+        ],
     }
 
 
@@ -2239,6 +2654,7 @@ def serialize_invoice(invoice: Invoice) -> dict[str, Any]:
             "id": invoice.id,
             "tenant_id": invoice.tenant_id,
             "filename": invoice.filename,
+            "storage_object_key": getattr(invoice, "storage_object_key", None),
             "vendor": invoice.vendor,
             "vendor_address": invoice.vendor_address,
             "vendor_contact": invoice.vendor_contact,
@@ -2272,10 +2688,14 @@ def serialize_invoice(invoice: Invoice) -> dict[str, Any]:
 
 
 @app.patch("/api/invoices/{invoice_id}", response_model=InvoiceBase)
-def update_invoice(invoice_id: UUID, payload: InvoiceUpdateRequest, session: Session = Depends(get_session)):
-    invoice = session.get(Invoice, invoice_id)
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Fatura não encontrada")
+def update_invoice(
+    invoice_id: UUID,
+    payload: InvoiceUpdateRequest,
+    session: Session = Depends(get_session),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
+):
+    tenant_id = resolve_tenant_scope(header_tenant_id=x_tenant_id)
+    invoice = require_invoice_for_tenant(session, invoice_id, tenant_id)
 
     updates = payload.model_dump(exclude_unset=True)
     line_items_payload = updates.pop("line_items", None)
@@ -2338,6 +2758,7 @@ def _process_upload_for_ingest(
     session: Session,
     source: str = "upload",
     persist_failure_record: bool = True,
+    storage_object_key: str | None = None,
 ) -> tuple[Invoice | None, RejectedDocument | None]:
     started_at = time.monotonic()
     filename = upload.filename or "documento"
@@ -2383,15 +2804,25 @@ def _process_upload_for_ingest(
 
         learning_debug = init_learning_debug()
         _watchtower_stage(task_id, "extraction")
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                extract_invoice_data,
-                upload,
-                cached_text,
-                cached_raw,
-                precheck_usage,
-            )
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            extract_invoice_data,
+            upload,
+            cached_text,
+            cached_raw,
+            precheck_usage,
+        )
+        executor_closed = False
+        try:
             extraction = future.result(timeout=90)
+        except FutureTimeout:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            executor_closed = True
+            raise
+        finally:
+            if not executor_closed:
+                executor.shutdown(wait=False, cancel_futures=True)
         logger.info(
             "Extraction finished for %s in %.2fs (is_invoice=%s, detected_type=%s)",
             filename,
@@ -2469,6 +2900,7 @@ def _process_upload_for_ingest(
         invoice = Invoice(
             tenant_id=tenant_id,
             filename=filename,
+            storage_object_key=storage_object_key,
             vendor=extraction["vendor"],
             vendor_address=extraction.get("vendor_address"),
             vendor_contact=extraction.get("vendor_contact"),
@@ -2613,6 +3045,7 @@ def ingest_invoices(
     session: Session = Depends(get_session),
 ):
     tenant_id = require_tenant(tenant_id)
+    _flush_storage_upload_queue(session, limit=20)
     if not files:
         raise HTTPException(status_code=400, detail="Selecione pelo menos um ficheiro")
 
@@ -2654,9 +3087,22 @@ def ingest_invoices(
 
     ingested_rows: list[Invoice] = []
     for upload, source in files_to_process:
+        upload_bytes = _read_upload_bytes(upload)
         invoice, rejection = _process_upload_for_ingest(tenant_id=tenant_id, upload=upload, session=session, source=source)
         if invoice:
             ingested_rows.append(invoice)
+            if source != "r2":
+                _, mirror_object_key = _mirror_to_storage_or_queue(
+                    tenant_id=tenant_id,
+                    filename=upload.filename or invoice.filename,
+                    content_type=upload.content_type,
+                    file_bytes=upload_bytes,
+                    session=session,
+                )
+                if mirror_object_key and not getattr(invoice, "storage_object_key", None):
+                    invoice.storage_object_key = mirror_object_key
+                    session.add(invoice)
+                    session.commit()
         if rejection:
             rejected_rows.append(rejection)
 
@@ -2667,6 +3113,103 @@ def ingest_invoices(
 
     return {
         "ingested": [serialize_invoice(invoice) for invoice in ingested_rows],
+        "rejected": [item.model_dump() for item in rejected_rows],
+    }
+
+
+@app.post("/api/tenants/{tenant_id}/storage/uploads/init", response_model=StorageUploadInitResponse)
+def init_storage_upload(tenant_id: str, payload: StorageUploadInitRequest):
+    tenant_id = require_tenant(tenant_id)
+    if payload.file_size is not None and payload.file_size > MAX_R2_OBJECT_SIZE:
+        raise HTTPException(status_code=400, detail="Ficheiro excede o limite de 50MB")
+
+    client = _r2_client()
+    expires_in = max(60, min(int(settings.r2_presign_expiry_seconds or 300), 3600))
+    filename = _sanitize_storage_filename(payload.filename)
+    object_key = _build_tenant_object_key(tenant_id, filename)
+
+    params: dict[str, Any] = {
+        "Bucket": settings.r2_bucket,
+        "Key": object_key,
+    }
+    content_type = (payload.content_type or "").strip()
+    if content_type:
+        params["ContentType"] = content_type
+
+    upload_url = client.generate_presigned_url(
+        "put_object",
+        Params=params,
+        ExpiresIn=expires_in,
+        HttpMethod="PUT",
+    )
+
+    return {
+        "bucket": settings.r2_bucket,
+        "object_key": object_key,
+        "upload_url": upload_url,
+        "expires_in_seconds": expires_in,
+    }
+
+
+@app.post("/api/tenants/{tenant_id}/storage/uploads/complete", response_model=IngestResponse)
+def complete_storage_upload(
+    tenant_id: str,
+    payload: StorageUploadCompleteRequest,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
+    tenant_id = require_tenant(tenant_id)
+    object_key = _assert_tenant_object_key(tenant_id, payload.object_key)
+    client = _r2_client()
+
+    try:
+        head = client.head_object(Bucket=settings.r2_bucket, Key=object_key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            raise HTTPException(status_code=404, detail="Objeto não encontrado no bucket") from exc
+        logger.warning("Falha head_object no R2 (%s): %s", object_key, exc)
+        raise HTTPException(status_code=502, detail="Falha ao validar objeto no storage") from exc
+
+    content_length = int(head.get("ContentLength") or 0)
+    if content_length <= 0:
+        raise HTTPException(status_code=400, detail="Objeto vazio no storage")
+    if content_length > MAX_R2_OBJECT_SIZE:
+        raise HTTPException(status_code=400, detail="Ficheiro excede o limite de 50MB")
+
+    try:
+        response = client.get_object(Bucket=settings.r2_bucket, Key=object_key)
+        body_stream = response.get("Body")
+        file_bytes = body_stream.read() if body_stream else b""
+    except ClientError as exc:
+        logger.warning("Falha get_object no R2 (%s): %s", object_key, exc)
+        raise HTTPException(status_code=502, detail="Falha ao ler objeto no storage") from exc
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Objeto vazio no storage")
+
+    fallback_name = os.path.basename(object_key) or "documento"
+    filename = _sanitize_storage_filename(payload.filename or fallback_name)
+    upload_content_type = (payload.content_type or str(head.get("ContentType") or "")).strip()
+    upload_headers = Headers({"content-type": upload_content_type}) if upload_content_type else None
+    upload = UploadFile(filename=filename, file=io.BytesIO(file_bytes), headers=upload_headers)
+
+    invoice, rejection = _process_upload_for_ingest(
+        tenant_id=tenant_id,
+        upload=upload,
+        session=session,
+        source="r2",
+        storage_object_key=object_key,
+    )
+
+    ingested_rows: list[Invoice] = [invoice] if invoice else []
+    rejected_rows: list[RejectedDocument] = [rejection] if rejection else []
+
+    for ingested in ingested_rows:
+        background_tasks.add_task(enqueue_invoice_embedding_job, ingested.id)
+
+    return {
+        "ingested": [serialize_invoice(ingested) for ingested in ingested_rows],
         "rejected": [item.model_dump() for item in rejected_rows],
     }
 
@@ -2692,7 +3235,7 @@ def chat_with_invoices(tenant_id: str, payload: ChatRequest, session: Session = 
         invoices = (
             session.query(Invoice)
             .options(selectinload(Invoice.line_items))
-            .filter(Invoice.id.in_(invoice_ids))
+            .filter(Invoice.id.in_(invoice_ids), Invoice.tenant_id == tenant_id)
             .all()
         )
     invoice_map = {str(inv.id): inv for inv in invoices}
@@ -2723,10 +3266,13 @@ def chat_with_invoices(tenant_id: str, payload: ChatRequest, session: Session = 
 
 
 @app.delete("/api/invoices/{invoice_id}")
-def delete_invoice(invoice_id: UUID, session: Session = Depends(get_session)):
-    invoice = session.get(Invoice, invoice_id)
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Fatura não encontrada")
+def delete_invoice(
+    invoice_id: UUID,
+    session: Session = Depends(get_session),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
+):
+    tenant_id = resolve_tenant_scope(header_tenant_id=x_tenant_id)
+    invoice = require_invoice_for_tenant(session, invoice_id, tenant_id)
 
     session.delete(invoice)
     session.commit()
@@ -2734,10 +3280,13 @@ def delete_invoice(invoice_id: UUID, session: Session = Depends(get_session)):
 
 
 @app.delete("/api/failed-imports/{failed_import_id}")
-def delete_failed_import(failed_import_id: UUID, session: Session = Depends(get_session)):
-    row = session.get(FailedImport, failed_import_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Falha de importação não encontrada")
+def delete_failed_import(
+    failed_import_id: UUID,
+    session: Session = Depends(get_session),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
+):
+    tenant_id = resolve_tenant_scope(header_tenant_id=x_tenant_id)
+    row = require_failed_import_for_tenant(session, failed_import_id, tenant_id)
     session.delete(row)
     session.commit()
     return {"ok": True}
@@ -2748,10 +3297,10 @@ def retry_failed_import(
     failed_import_id: UUID,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
 ):
-    row = session.get(FailedImport, failed_import_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Falha de importação não encontrada")
+    tenant_id = resolve_tenant_scope(header_tenant_id=x_tenant_id)
+    row = require_failed_import_for_tenant(session, failed_import_id, tenant_id)
     if not row.file_blob:
         raise HTTPException(status_code=400, detail="Este ficheiro não foi guardado para retry automático")
 
@@ -2764,7 +3313,7 @@ def retry_failed_import(
     session.commit()
 
     invoice, rejection = _process_upload_for_ingest(
-        tenant_id=row.tenant_id,
+        tenant_id=tenant_id,
         upload=upload,
         session=session,
         source="retry",
@@ -2772,7 +3321,11 @@ def retry_failed_import(
     )
 
     if invoice:
-        current = session.get(FailedImport, failed_import_id)
+        current = (
+            session.query(FailedImport)
+            .filter(FailedImport.id == failed_import_id, FailedImport.tenant_id == tenant_id)
+            .one_or_none()
+        )
         if current:
             session.delete(current)
             session.commit()
@@ -2780,7 +3333,11 @@ def retry_failed_import(
         return {"ok": True, "ingested": serialize_invoice(invoice), "rejected": None}
 
     if rejection:
-        current = session.get(FailedImport, failed_import_id)
+        current = (
+            session.query(FailedImport)
+            .filter(FailedImport.id == failed_import_id, FailedImport.tenant_id == tenant_id)
+            .one_or_none()
+        )
         if current:
             current.reason = rejection.reason
             current.detected_type = rejection.detected_type
@@ -2795,10 +3352,10 @@ def apply_invoice_correction(
     payload: InvoiceCorrectionRequest,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
 ):
-    invoice = session.get(Invoice, invoice_id)
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Fatura não encontrada")
+    tenant_id = resolve_tenant_scope(header_tenant_id=x_tenant_id)
+    invoice = require_invoice_for_tenant(session, invoice_id, tenant_id)
     if not invoice.raw_text:
         raise HTTPException(status_code=400, detail="Fatura não tem texto bruto guardado")
 
@@ -2842,10 +3399,13 @@ def apply_invoice_correction(
 
 
 @app.get("/api/invoices/{invoice_id}/corrections", response_model=InvoiceCorrectionListResponse)
-def list_invoice_corrections(invoice_id: UUID, session: Session = Depends(get_session)):
-    invoice = session.get(Invoice, invoice_id)
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Fatura não encontrada")
+def list_invoice_corrections(
+    invoice_id: UUID,
+    session: Session = Depends(get_session),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
+):
+    tenant_id = resolve_tenant_scope(header_tenant_id=x_tenant_id)
+    invoice = require_invoice_for_tenant(session, invoice_id, tenant_id)
     corrections = (
         session.query(InvoiceCorrection)
         .filter(InvoiceCorrection.invoice_id == invoice_id)

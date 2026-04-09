@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     skip_db_init: bool = False
     allowed_origins: list[str] = Field(default_factory=lambda: ["*"])
 
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket: str = ""
+    r2_endpoint: str = ""
+    r2_presign_expiry_seconds: int = 300
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -75,6 +75,7 @@ class InvoiceBase(BaseModel):
     id: uuid.UUID
     tenant_id: str
     filename: str
+    storage_object_key: Optional[str] = None
     vendor: Optional[str] = None
     vendor_address: Optional[str] = None
     vendor_contact: Optional[str] = None
@@ -139,6 +140,7 @@ class InvoiceUpdateRequest(BaseModel):
     currency: Optional[str] = None
     notes: Optional[str] = None
     status: Optional[str] = None
+    requires_review: Optional[bool] = None
     line_items: Optional[list[InvoiceLineItemUpdateRequest]] = None
 
 
@@ -243,6 +245,25 @@ class IngestResponse(BaseModel):
     rejected: list[RejectedDocument] = []
 
 
+class StorageUploadInitRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=255)
+    content_type: Optional[str] = Field(None, max_length=128)
+    file_size: Optional[int] = Field(None, gt=0, le=50 * 1024 * 1024)
+
+
+class StorageUploadInitResponse(BaseModel):
+    bucket: str
+    object_key: str
+    upload_url: str
+    expires_in_seconds: int
+
+
+class StorageUploadCompleteRequest(BaseModel):
+    object_key: str = Field(..., min_length=1, max_length=1024)
+    filename: Optional[str] = Field(None, min_length=1, max_length=255)
+    content_type: Optional[str] = Field(None, max_length=128)
+
+
 class InvoiceCorrectionRequest(BaseModel):
     message: str = Field(..., min_length=3, max_length=1000)
 
@@ -294,3 +315,25 @@ class CostTrendSummary(BaseModel):
 class CostTrendResponse(BaseModel):
     summary: CostTrendSummary
     points: list[CostTrendPoint]
+
+
+class UploadTelemetryEventRequest(BaseModel):
+    step: str = Field(..., pattern="^(validate|extract|review|save)$")
+    status: str = Field(..., pattern="^(enter|success|failure)$")
+    session_id: Optional[str] = Field(None, max_length=128)
+    context: Optional[str] = Field(None, max_length=256)
+    timestamp: Optional[datetime] = None
+
+
+class UploadTelemetryStepSummary(BaseModel):
+    step: str
+    enter: int = 0
+    success: int = 0
+    failure: int = 0
+
+
+class UploadTelemetryFunnelResponse(BaseModel):
+    tenant_id: str
+    total_events: int
+    steps: list[UploadTelemetryStepSummary]
+    generated_at: datetime

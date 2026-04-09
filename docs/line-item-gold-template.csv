@@ -1,0 +1,5 @@
+vendor,raw_description,canonical_name,line_type,line_category,normalized_unit,tax_rate
+# Example rows below (remove # and replace values)
+# Vodafone,Mensalidade Red Infinity Giga,Vodafone Mobile Plan,subscription,services/telecom,unit,23
+# GreenGeeks,RH-80 (EUROPE) - azoreslife.com,GreenGeeks Hosting RH-80,subscription,services/hosting,unit,0
+# PRIO,Gasóleo simples,Diesel Fuel,product,fuel,l,23
